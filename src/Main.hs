@@ -1,5 +1,12 @@
+{-# LANGUAGE QuasiQuotes #-}
 module Main where
+import Language.C.Quote.C
+import Language.C.Smart
+import Text.PrettyPrint.Mainland (putDocLn, ppr)
 
-main :: IO ()
+foo = [cexp|x + 1|]
+bar = [cexp|y|]
+baz = bar + foo
+
 main = do
-  putStrLn "hello world"
+  putDocLn $ ppr baz

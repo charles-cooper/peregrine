@@ -4,6 +4,7 @@ let
   haskellEnv = pkgs.haskell.packages.lts-5_5.ghcWithPackages (p: with p; [
     interpolatedstring-perl6
     language-c-quote
+    mainland-pretty
   ]);
 in
   stdenv.mkDerivation {
