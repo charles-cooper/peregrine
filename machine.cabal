@@ -20,3 +20,4 @@ executable language-c-experiment
                      , language-c-quote
                      , mainland-pretty
                      , interpolatedstring-perl6
+                     , neat-interpolation
