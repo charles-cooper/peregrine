@@ -1,13 +1,16 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Main where
+
 import Protocol.Tmx.TAQ as TAQ
 import Protocol
+
 import Language.C.Quote.C
 import Language.C.Smart ()
 import qualified Language.C.Syntax as C
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty)
 import Text.InterpolatedString.Perl6 (qc)
+import Data.Loc (SrcLoc(..), Loc(..))
 
 import Data.List (nub, sort)
 import Data.Monoid
@@ -15,7 +18,10 @@ import Data.Monoid
 import Control.Lens
 import Control.Monad (forM)
 
-import Data.Loc (SrcLoc(..), Loc(..))
+import System.Directory
+import System.Process
+import System.Exit
+import System.IO
 
 noloc = SrcLoc NoLoc
 
@@ -88,10 +94,9 @@ mkCompUnit (CompUnit includes types funcs) = [cunit|
     typedecl ty                = C.DecDef [cdecl|$ty:ty;|] noloc
     fundecl func               = C.FuncDef func noloc
 
-cReadIntegral ty = CompUnit ["cstdint", "cassert", "cctypes"] [] $ pure [cfun|
+cReadIntegral ty = CompUnit ["cstdint", "cassert", "cctype"] [] $ pure [cfun|
   $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
     $ty:ty ret;
-    unsigned len;
     while (len--) {
       assert(isdigit(*buf));
       ret = ret * 10 + (*buf - '0');
@@ -103,11 +108,33 @@ cReadIntegral ty = CompUnit ["cstdint", "cassert", "cctypes"] [] $ pure [cfun|
   where
     funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
 
+cmain = CompUnit [] [] $ pure [cfun|int main() {} |]
+
+----------------------------
+-- Compilation
+----------------------------
+
+getBuildDir :: IO FilePath
+getBuildDir = (++"/bin") <$> getCurrentDirectory
+
+compile :: CompUnit -> IO ()
+compile code = do
+  buildDir <- getBuildDir
+  createDirectoryIfMissing False buildDir
+  let intermediateFile = [qc|{buildDir}/main.cpp|]
+  writeFile intermediateFile $ pretty 80 (ppr (mkCompUnit code))
+
+  (_, _, _, gcc) <- createProcess $
+    (shell [qc|g++ -std=c++11 -O2 -g {intermediateFile}|])
+    { cwd = Just buildDir }
+
+  ecode <- waitForProcess gcc
+  case ecode of
+    ExitSuccess   -> return ()
+    ExitFailure _ -> error "gcc failed."
+
 main = do
-{-forM (taq^.outgoingMessages) $ \msg -> do
-    putDocLn . ppr . mkCompUnit $ genStruct msg
-    putDocLn . ppr $ readStruct msg-}
-  putDocLn . ppr $ mkCompUnit $
-       cReadIntegral uint
+  compile $ cReadIntegral uint
     <> (mconcat $ genStruct <$> taq^.outgoingMessages)
     <> (mconcat $ readStruct <$> taq^.outgoingMessages)
+    <> cmain
