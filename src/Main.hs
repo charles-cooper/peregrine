@@ -1,11 +1,13 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 import Protocol.Tmx.TAQ as TAQ
 import Protocol
 import Language.C.Quote.C
 import Language.C.Smart ()
 import qualified Language.C.Syntax as C
-import Text.PrettyPrint.Mainland (putDocLn, ppr)
+import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty)
+import Text.InterpolatedString.Perl6 (qc)
 
 import Control.Lens
 import Control.Monad (forM)
@@ -41,5 +43,34 @@ genStruct msg = [cty|
       where
         cnm = rawIden (cname nm)
 
+readStruct :: Message TAQ -> C.Func
+readStruct msg = [cfun|
+    void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
+      /* TODO */
+      return ;
+    }
+  |]
+  where
+    funName :: String = [qc|read_{msg^.msgName}|]
+    structName        = msg^.msgName
+
+cReadIntegral ty = [cfun|
+  $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
+    $ty:ty ret;
+    unsigned len;
+    while (len--) {
+      assert(isdigit(*buf));
+      ret = ret * 10 + (*buf - '0');
+      ++buf;
+    }
+    return ret;
+  }
+  |]
+  where
+    funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
+
 main = do
-  forM (taq^.outgoingMessages) $ putDocLn . ppr . genStruct
+  forM (taq^.outgoingMessages) $ \msg -> do
+    putDocLn . ppr $ genStruct msg
+    putDocLn . ppr $ readStruct msg
+  putDocLn . ppr $ cReadIntegral uint
