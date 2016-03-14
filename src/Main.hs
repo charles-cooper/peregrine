@@ -9,11 +9,18 @@ import qualified Language.C.Syntax as C
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty)
 import Text.InterpolatedString.Perl6 (qc)
 
+import Data.List (nub, sort)
+import Data.Monoid
+
 import Control.Lens
 import Control.Monad (forM)
 
+import Data.Loc (SrcLoc(..), Loc(..))
+
+noloc = SrcLoc NoLoc
+
 char   = [cty|char|]
-uchar  = [cty|typename uint8_t|]
+uchar  = [cty|typedef unsigned char uint8_t|]
 bool   = [cty|typename bool|]
 ushort = [cty|typename uint16_t|]
 uint   = [cty|typename uint32_t|]
@@ -22,13 +29,14 @@ ulong  = [cty|typename uint64_t|]
 assert :: Bool -> a -> a
 assert pred a = if pred then a else (error "Assertion failed")
 
-genStruct :: Message TAQ -> C.Type
-genStruct msg = [cty|
-  struct $id:(msg^.msgName) {
-    $sdecls:decls
-  }
-  |]
+genStruct :: Message TAQ -> CompUnit -- C.Type
+genStruct msg = CompUnit [] [ty] []
   where
+    ty = [cty|
+      struct $id:(msg^.msgName) {
+        $sdecls:decls
+      }
+      |]
     decls = mkDecl <$> (msg^.fields)
     mkDecl f@(Field _ len nm ty notes)
       | ty==Numeric    && len==9 = [csdecl|$ty:uint   $id:cnm;|]
@@ -43,8 +51,8 @@ genStruct msg = [cty|
       where
         cnm = rawIden (cname nm)
 
-readStruct :: Message TAQ -> C.Func
-readStruct msg = [cfun|
+readStruct :: Message TAQ -> CompUnit
+readStruct msg = CompUnit [] [] $ pure [cfun|
     void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
       /* TODO */
       return ;
@@ -54,7 +62,33 @@ readStruct msg = [cfun|
     funName :: String = [qc|read_{msg^.msgName}|]
     structName        = msg^.msgName
 
-cReadIntegral ty = [cfun|
+data CompUnit = CompUnit
+  { includes  :: [String]
+  , typedecls :: [C.Type]
+  , functions :: [C.Func]
+  }
+instance Monoid CompUnit where
+  mempty = CompUnit [] [] []
+  mappend (CompUnit a b c) (CompUnit a' b' c') =
+    CompUnit (a<>a') (b<>b') (c<>c')
+
+mkCompUnit :: CompUnit -> [C.Definition]
+mkCompUnit (CompUnit includes types funcs) = [cunit|
+    /* Includes */
+    $edecls:(nub $ sort $ include <$> includes)
+
+    /* Types */
+    $edecls:(typedecl <$> types)
+
+    /* Functions */
+    $edecls:(fundecl <$> funcs)
+  |]
+  where
+    include (header :: String) = C.EscDef [qc|#include <{header}>|] noloc
+    typedecl ty                = C.DecDef [cdecl|$ty:ty;|] noloc
+    fundecl func               = C.FuncDef func noloc
+
+cReadIntegral ty = CompUnit ["cstdint", "cassert", "cctypes"] [] $ pure [cfun|
   $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
     $ty:ty ret;
     unsigned len;
@@ -70,7 +104,10 @@ cReadIntegral ty = [cfun|
     funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
 
 main = do
-  forM (taq^.outgoingMessages) $ \msg -> do
-    putDocLn . ppr $ genStruct msg
-    putDocLn . ppr $ readStruct msg
-  putDocLn . ppr $ cReadIntegral uint
+{-forM (taq^.outgoingMessages) $ \msg -> do
+    putDocLn . ppr . mkCompUnit $ genStruct msg
+    putDocLn . ppr $ readStruct msg-}
+  putDocLn . ppr $ mkCompUnit $
+       cReadIntegral uint
+    <> (mconcat $ genStruct <$> taq^.outgoingMessages)
+    <> (mconcat $ readStruct <$> taq^.outgoingMessages)

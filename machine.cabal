@@ -34,3 +34,4 @@ executable machine
                      , lens
                      , string-conversions
                      , text
+                     , srcloc
