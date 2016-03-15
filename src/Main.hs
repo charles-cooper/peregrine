@@ -14,7 +14,7 @@ import           Language.C.Utils (C, CompUnit, depends, include, noloc)
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
 import Text.InterpolatedString.Perl6 (qc)
 
-import Data.List (nub, sort)
+import Data.List (nub, sort, intercalate)
 import Utils
 
 import Data.Bits
@@ -85,32 +85,31 @@ readStruct msg = do
     structName        = msg^.msgName
     ofsts             = scanl (+) 0 (msg^.fields & map _len)
 
-    -- don't have a good way of grabbing all called functions.
-    -- this is a crude way of stitching them in by hand.
-    readMemberDecl f@(Field _ len _ ty _) = case ty of
-      Numeric -> Just <$> cReadIntegral (C.simplety $ mkTy f)
-      _ -> return Nothing
-
     readMember ofst f@(Field _ len nm ty _) = case ty of
 
       Numeric    -> runIntegral
 
       Alphabetic -> return $ if len == 1
-                      then [cstm|dst->$id:cnm = *buf;|]
-                      else [cstm|memcpy(&dst->$id:cnm, buf, $len);|]
+                      then [cstm|dst->$id:cnm = *$buf;|]
+                      else [cstm|memcpy(&dst->$id:cnm, $buf, $len);|]
 
-      Boolean    -> return [cstm|dst->$id:cnm = (*buf == '1');|]
+      Boolean    -> return [cstm|dst->$id:cnm = (*$buf == '1');|]
 
       Date       -> runIntegral
       Time       -> runIntegral
       where
+        buf = [cexp|buf + $ofst|]
         runIntegral = do
           dep <- cReadIntegral (C.simplety $ mkTy f)
-          return [cstm|dst->$id:cnm = $id:(getId dep) (buf, $len); |]
+          return [cstm|dst->$id:cnm = $id:(getId dep) ($buf, $len); |]
 
         cnm     = rawIden (cname nm)
 
     stms = zipWithM readMember ofsts (msg^.fields)
+
+unId :: C.Id -> String
+unId (C.Id str _)     = str
+unIt (C.AntiId str _) = str
 
 class Identifiable a where
   getId :: a -> C.Id
@@ -164,15 +163,33 @@ cReadIntegral ty = do
 msgLen :: Message TAQ -> Int
 msgLen msg = sum $ _len <$> _fields msg
 
+printFmt :: C.Exp -> Message TAQ -> (String, [C.Exp])
+printFmt root msg = let
+  (fmts, ids) = unzip $ fmt <$> _fields msg
+  in (intercalate ", " fmts, mconcat ids)
+  where
+    fmt (Field _ len nm ty _)
+      | ty==Numeric     = ([qc|{nm}: %d|], [exp nm])
+      | ty==Alphabetic  = ([qc|{nm}: %.{len}s|], [[cexp|&$(exp nm)|]])
+      | ty==Boolean     = ([qc|{nm}: %d|], [exp nm])
+      | ty==Date        = ([qc|{nm}: %d|], [exp nm])
+      | ty==Time        = ([qc|{nm}: %d|], [exp nm])
+    exp nm = [cexp|$root.$id:(rawIden $ cname nm)|]
+
 mainLoop :: C C.Func
 mainLoop = do
   include "stdio.h"
   cases <- forM (_outgoingMessages taq) $ \msg -> do
     readMsg <- readStruct msg
     struct <- depends $ genStruct msg
+    let prefix = [cexp|msg.$id:(getId struct)|]
+    let printf = printFmt prefix msg
     return [cstm|case $exp:(_tag msg) : {
-      fread(buf, 1, $(msgLen msg), stdin);
+      if (fread(buf, 1, $(msgLen msg + 1), stdin) < 0) {
+        return -1;
+      }
       $id:(getId readMsg) (&msg.$id:(getId struct), buf);
+      printf($(fst printf ++ "\n"), $args:(snd printf));
       break;
     }|]
   structs <- forM (_outgoingMessages taq) $ \msg -> do
@@ -205,9 +222,12 @@ cmain = do
   depends [cfun|int main() {
     char buf[$bufLen];
     int ret = 0;
+    int pkts = 0;
     while(ret >= 0) {
       ret = $id:(getId runMain) (buf);
+      ++pkts;
     }
+    printf("%d\n", pkts);
   }|]
   where
     bufLen = maximum $ foreach (_outgoingMessages taq) $
@@ -254,7 +274,7 @@ main = do
       let dataFile = "data/20150826TradesAndQuotesDaily.lz4"
       let exe = "bin/a.out"
       need [dataFile, exe]
-      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe}|] []
+      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} | head -n100 |] []
     want ["Run a.out"]
 
 
