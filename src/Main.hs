@@ -178,16 +178,20 @@ compile code = do
   src %> \out -> do
     writeFile' out (prettyPragma 80 (ppr (mkCompUnit code)))
 
-  want [out]
-
 main = do
   shakeArgs shakeOptions $ do
     compile $ do
       mapM readStruct $ taq^.outgoingMessages
       cmain
-    want ["data/20150826TradesAndQuotesDaily.lz4"]
     "data/*.lz4" %> \out -> do
       let src = "/mnt/efs/ftp/tmxdatalinx.com" </> (takeFileName out) -<.> "gz"
       need [src]
       command [Shell] [qc|gzip -d < {src} | lz4 -9 > {out}|] []
+    phony "Run a.out" $ do
+      let dataFile = "data/20150826TradesAndQuotesDaily.lz4"
+      let exe = "bin/a.out"
+      need [dataFile, exe]
+      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe}|] []
+    want ["Run a.out"]
+  renameFile "bin/main.cpp" "bin/main-debug.cpp"
 
