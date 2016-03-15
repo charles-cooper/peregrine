@@ -9,12 +9,15 @@ import           Language.C.Quote.C
 import           Language.C.Smart ()
 import qualified Language.C.Syntax as C
 import qualified Language.C.Utils as C
-import           Language.C.Utils (C, CompUnit, depends, noloc)
+import           Language.C.Utils (C, CompUnit, depends, include, noloc)
 
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
 import Text.InterpolatedString.Perl6 (qc)
 
 import Data.List (nub, sort)
+import Utils
+
+import Data.Bits
 
 import Control.Lens
 import Control.Monad
@@ -39,7 +42,7 @@ assert pred a = if pred then a else (error "Assertion failed")
 
 mkCsdecl :: String -> C.GType -> C.FieldGroup
 mkCsdecl nm (C.SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
-mkCsdecl nm (C.ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$const:sz]; |]
+mkCsdecl nm (C.ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$sz]; |]
 
 genStruct :: Message TAQ -> C.Type
 genStruct msg = ty
@@ -65,15 +68,15 @@ mkTy f@(Field _ len _ ty _)
   | ty==Time                 = C.SimpleTy uint -- assert?
   | otherwise                = error "Unknown case."
 
-readStruct :: Message TAQ -> C CompUnit
+readStruct :: Message TAQ -> C C.Func
 readStruct msg = do
   depends $ genStruct msg
   include "cstring"
-  depends =<< impl
+  impl
   where
     impl = do
       pureStms <- stms
-      return [cfun|
+      depends [cfun|
         void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
           $stms:pureStms
         }
@@ -94,7 +97,7 @@ readStruct msg = do
 
       Alphabetic -> return $ if len == 1
                       then [cstm|dst->$id:cnm = *buf;|]
-                      else [cstm|memcpy(&dst->$id:cnm, buf, $const:len);|]
+                      else [cstm|memcpy(&dst->$id:cnm, buf, $len);|]
 
       Boolean    -> return [cstm|dst->$id:cnm = (*buf == '1');|]
 
@@ -103,7 +106,7 @@ readStruct msg = do
       where
         runIntegral = do
           dep <- cReadIntegral (C.simplety $ mkTy f)
-          return [cstm|dst->$id:cnm = $id:(getId dep) (buf, $const:len); |]
+          return [cstm|dst->$id:cnm = $id:(getId dep) (buf, $len); |]
 
         cnm     = rawIden (cname nm)
 
@@ -115,6 +118,14 @@ class Identifiable a where
 instance Identifiable C.Func where
   getId (C.Func _ iden _ _ _ _)      = iden
   getId (C.OldFunc _ iden _ _ _ _ _) = iden
+-- thi sisn't exactly right ..
+instance Identifiable C.Type where
+  getId t@(C.Type (C.DeclSpec _ _ ty _) _ _) = case ty of
+    C.Tstruct (Just id) _ _ _ -> id
+    C.Tunion  (Just id) _ _ _ -> id
+    C.Tenum   (Just id) _ _ _ -> id
+    _ -> error $ "Not identifiable: " ++ show t
+  getId t = error $ "Not identifiable: " ++ show t
 
 mkCompUnit :: C a -> [C.Definition]
 mkCompUnit code = [cunit|
@@ -136,7 +147,6 @@ mkCompUnit code = [cunit|
 cReadIntegral ty = do
   mapM include ["cstdint", "cassert", "cctype"]
   depends impl
-  return impl
   where
     funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
     impl = [cfun|
@@ -151,14 +161,59 @@ cReadIntegral ty = do
       }
     |]
 
-include :: String -> C CompUnit
-include = depends . C.Includes
+msgLen :: Message TAQ -> Int
+msgLen msg = sum $ _len <$> _fields msg
 
+mainLoop :: C C.Func
+mainLoop = do
+  include "stdio.h"
+  cases <- forM (_outgoingMessages taq) $ \msg -> do
+    readMsg <- readStruct msg
+    struct <- depends $ genStruct msg
+    return [cstm|case $exp:(_tag msg) : {
+      fread(buf, 1, $(msgLen msg), stdin);
+      $id:(getId readMsg) (&msg.$id:(getId struct), buf);
+      break;
+    }|]
+  structs <- forM (_outgoingMessages taq) $ \msg -> do
+    struct <- depends $ genStruct msg
+    return [csdecl|struct $id:(getId struct) $id:(getId struct);|]
+
+  depends [cfun|
+    int handle(char *buf) {
+      union {
+        $sdecls:structs
+      } msg;
+      if (fread(buf, 1, 1, stdin) < 1) {
+        return -1;
+      }
+      switch (*buf) {
+        $stms:cases
+        default: {
+          assert("Failed to read tag.");
+          return -1;
+        }
+      }
+      return 1;
+    }
+  |]
+
+cmain :: C C.Func
 cmain = do
   include "cstdio"
+  runMain <- mainLoop
   depends [cfun|int main() {
-    printf("Hello!!\n");
+    char buf[$bufLen];
+    int ret = 0;
+    while(ret >= 0) {
+      ret = $id:(getId runMain) (buf);
+    }
   }|]
+  where
+    bufLen = maximum $ foreach (_outgoingMessages taq) $
+      rotateL (1::Int) . (+1) . logBase2 . msgLen
+
+    logBase2 x = finiteBitSize x - 1 - countLeadingZeros x
 
 ----------------------------
 -- Compilation
@@ -171,27 +226,35 @@ compile code = do
   let src = [qc|{buildDir}/main.cpp|]
   let out = [qc|{buildDir}/a.out|]
 
-  out %> \out -> do
-    need [src]
-    command_ [Cwd buildDir, Shell] [qc|g++ -std=c++11 -O2 -g main.cpp|] []
-
   src %> \out -> do
-    writeFile' out (prettyPragma 80 (ppr (mkCompUnit code)))
+    alwaysRerun
+    writeFileChanged out (prettyPragma 80 (ppr (mkCompUnit code)))
+
+  out %> \out -> do
+
+    need [src]
+
+    command_ [Cwd buildDir, Shell] -- Compile
+      [qc|g++ -std=c++11 -march=native -O2 -g main.cpp|] []
+
+    command_ [Cwd buildDir, Shell] -- Grab the demangled assembly
+      [qc|objdump -Cd a.out > main.s|] []
 
 main = do
   shakeArgs shakeOptions $ do
-    compile $ do
-      mapM readStruct $ taq^.outgoingMessages
-      cmain
+
+    compile cmain
+
     "data/*.lz4" %> \out -> do
       let src = "/mnt/efs/ftp/tmxdatalinx.com" </> (takeFileName out) -<.> "gz"
       need [src]
       command [Shell] [qc|gzip -d < {src} | lz4 -9 > {out}|] []
+
     phony "Run a.out" $ do
       let dataFile = "data/20150826TradesAndQuotesDaily.lz4"
       let exe = "bin/a.out"
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe}|] []
     want ["Run a.out"]
-  renameFile "bin/main.cpp" "bin/main-debug.cpp"
+
 

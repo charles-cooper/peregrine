@@ -4,6 +4,7 @@ module Language.C.Utils (
   Includes(..),
   CompUnit(..),
   depends,
+  include,
   noloc,
   getCompUnit
 ) where
@@ -27,12 +28,13 @@ instance Monoid CompUnit where
     CompUnit (a<>a') (b<>b') (c<>c')
 
 type C a = State CompUnit a
-depends :: TopLevel a => a -> C CompUnit
+depends :: TopLevel a => a -> C a
 depends d = do
-  modify (<>cu)
-  return $ cu
-  where
-    cu = define d
+  modify (<>define d)
+  return d
+
+include :: String -> C Includes
+include = depends . Includes
 
 getCompUnit :: C a -> CompUnit
 getCompUnit c = execState c mempty
