@@ -5,44 +5,24 @@ module Main where
 import Protocol.Tmx.TAQ as TAQ
 import Protocol
 
-import Language.C.Quote.C
-import Language.C.Smart ()
+import           Language.C.Quote.C
+import           Language.C.Smart ()
 import qualified Language.C.Syntax as C
+import qualified Language.C.Utils as C
+import           Language.C.Utils (C, CompUnit, depends, noloc)
+
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
 import Text.InterpolatedString.Perl6 (qc)
-import Data.Loc (SrcLoc(..), Loc(..))
 
 import Data.List (nub, sort)
-import Data.Monoid
 
 import Control.Lens
 import Control.Monad
-import Control.Monad.State
 
 import System.Directory
 import System.Process
 import System.Exit
 import System.IO
-
-type C a = State CompUnit a
-depends :: TopLevel a => a -> C CompUnit
-depends d = do
-  modify (<>cu)
-  return $ cu
-  where
-    cu = define d
-
-newtype Includes = Includes String
-class TopLevel a where
-  define :: a -> CompUnit
-instance TopLevel Includes where
-  define inc  = CompUnit [inc] [] []
-instance TopLevel C.Type where
-  define ty   = CompUnit [] [ty] []
-instance TopLevel C.Func where
-  define func = CompUnit [] [] [func]
-
-noloc = SrcLoc NoLoc
 
 char   = [cty|char|]
 uchar  = [cty|typename uint8_t|]
@@ -54,13 +34,9 @@ ulong  = [cty|typename uint64_t|]
 assert :: Bool -> a -> a
 assert pred a = if pred then a else (error "Assertion failed")
 
--- TODO put this in an 'import as C' module
-data CGenTy = ArrayTy  { arrayty :: C.Type, arraysize :: Int }
-            | SimpleTy { simplety :: C.Type }
-
-mkCsdecl :: String -> CGenTy -> C.FieldGroup
-mkCsdecl nm (SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
-mkCsdecl nm (ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$const:sz]; |]
+mkCsdecl :: String -> C.GType -> C.FieldGroup
+mkCsdecl nm (C.SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
+mkCsdecl nm (C.ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$const:sz]; |]
 
 genStruct :: Message TAQ -> C.Type
 genStruct msg = ty
@@ -73,23 +49,23 @@ genStruct msg = ty
     decls = declare <$> (msg^.fields)
     declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) $ mkTy f
 
-mkTy :: Field TAQ -> CGenTy
+mkTy :: Field TAQ -> C.GType
 mkTy f@(Field _ len _ ty _)
-  | ty==Numeric    && len==9 = SimpleTy uint
-  | ty==Numeric    && len==7 = SimpleTy uint
-  | ty==Numeric    && len==3 = SimpleTy ushort
+  | ty==Numeric    && len==9 = C.SimpleTy uint
+  | ty==Numeric    && len==7 = C.SimpleTy uint
+  | ty==Numeric    && len==3 = C.SimpleTy ushort
   | ty==Numeric              = error $ "Unknown integer len for " ++ show f
-  | ty==Alphabetic && len==1 = SimpleTy char
-  | ty==Alphabetic           = ArrayTy char len
-  | ty==Boolean              = assert (len==1) $ SimpleTy bool
-  | ty==Date                 = SimpleTy uint -- assert?
-  | ty==Time                 = SimpleTy uint -- assert?
+  | ty==Alphabetic && len==1 = C.SimpleTy char
+  | ty==Alphabetic           = C.ArrayTy char len
+  | ty==Boolean              = assert (len==1) $ C.SimpleTy bool
+  | ty==Date                 = C.SimpleTy uint -- assert?
+  | ty==Time                 = C.SimpleTy uint -- assert?
   | otherwise                = error "Unknown case."
 
 readStruct :: Message TAQ -> C CompUnit
 readStruct msg = do
   depends $ genStruct msg
-  depends $ Includes "cstring"
+  depends $ C.Includes "cstring"
   depends =<< impl
   where
     impl = do
@@ -106,7 +82,7 @@ readStruct msg = do
     -- don't have a good way of grabbing all called functions.
     -- this is a crude way of stitching them in by hand.
     readMemberDecl f@(Field _ len _ ty _) = case ty of
-      Numeric -> Just <$> cReadIntegral (simplety $ mkTy f)
+      Numeric -> Just <$> cReadIntegral (C.simplety $ mkTy f)
       _ -> return Nothing
 
     readMember ofst f@(Field _ len nm ty _) = case ty of
@@ -123,7 +99,7 @@ readStruct msg = do
       Time       -> runIntegral
       where
         runIntegral = do
-          dep <- cReadIntegral (simplety $ mkTy f)
+          dep <- cReadIntegral (C.simplety $ mkTy f)
           return [cstm|dst->$id:cnm = $id:(getId dep) (buf, $const:len); |]
 
         cnm     = rawIden (cname nm)
@@ -137,17 +113,6 @@ instance Identifiable C.Func where
   getId (C.Func _ iden _ _ _ _)      = iden
   getId (C.OldFunc _ iden _ _ _ _ _) = iden
 
-data CompUnit = CompUnit
-  { includes  :: [Includes]
-  , typedecls :: [C.Type]
-  , functions :: [C.Func]
-  }
-
-instance Monoid CompUnit where
-  mempty = CompUnit [] [] []
-  mappend (CompUnit a b c) (CompUnit a' b' c') =
-    CompUnit (a<>a') (b<>b') (c<>c')
-
 mkCompUnit :: C a -> [C.Definition]
 mkCompUnit code = [cunit|
     /* Includes */
@@ -160,13 +125,13 @@ mkCompUnit code = [cunit|
     $edecls:(fundecl <$> nub funcs)
   |]
   where
-    include (Includes header)  = C.EscDef [qc|#include <{header}>|] noloc
-    typedecl ty                = C.DecDef [cdecl|$ty:ty;|] noloc
-    fundecl func               = C.FuncDef func noloc
-    (CompUnit incls tys funcs) = execState code mempty
+    include (C.Includes header)  = C.EscDef [qc|#include <{header}>|] noloc
+    typedecl ty                  = C.DecDef [cdecl|$ty:ty;|] noloc
+    fundecl func                 = C.FuncDef func noloc
+    (C.CompUnit incls tys funcs) = C.getCompUnit code
 
 cReadIntegral ty = do
-  mapM (depends . Includes) ["cstdint", "cassert", "cctype"]
+  mapM (depends . C.Includes) ["cstdint", "cassert", "cctype"]
   depends impl
   return impl
   where
