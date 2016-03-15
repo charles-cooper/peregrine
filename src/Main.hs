@@ -68,7 +68,7 @@ mkTy f@(Field _ len _ ty _)
 readStruct :: Message TAQ -> C CompUnit
 readStruct msg = do
   depends $ genStruct msg
-  depends $ C.Includes "cstring"
+  include "cstring"
   depends =<< impl
   where
     impl = do
@@ -134,7 +134,7 @@ mkCompUnit code = [cunit|
     (C.CompUnit incls tys funcs) = C.getCompUnit code
 
 cReadIntegral ty = do
-  mapM (depends . C.Includes) ["cstdint", "cassert", "cctype"]
+  mapM include ["cstdint", "cassert", "cctype"]
   depends impl
   return impl
   where
@@ -151,7 +151,14 @@ cReadIntegral ty = do
       }
     |]
 
-cmain = depends [cfun|int main() {} |]
+include :: String -> C CompUnit
+include = depends . C.Includes
+
+cmain = do
+  include "cstdio"
+  depends [cfun|int main() {
+    printf("Hello!!\n");
+  }|]
 
 ----------------------------
 -- Compilation
