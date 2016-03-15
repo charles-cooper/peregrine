@@ -1,3 +1,5 @@
-default.nix
 .stack-work
+.shake
 bin
+data
+default.nix

@@ -24,6 +24,9 @@ import System.Process
 import System.Exit
 import System.IO
 
+import Development.Shake
+import Development.Shake.FilePath
+
 char   = [cty|char|]
 uchar  = [cty|typename uint8_t|]
 bool   = [cty|typename bool|]
@@ -154,27 +157,30 @@ cmain = depends [cfun|int main() {} |]
 -- Compilation
 ----------------------------
 
-getBuildDir :: IO FilePath
-getBuildDir = (++"/bin") <$> getCurrentDirectory
-
-compile :: C a -> IO ()
+compile :: C a -> Rules ()
 compile code = do
-  buildDir <- getBuildDir
-  createDirectoryIfMissing False buildDir
-  let intermediateFile = [qc|{buildDir}/main.cpp|]
-  writeFile intermediateFile $ prettyPragma 80 (ppr (mkCompUnit code))
 
-  (_, _, _, gcc) <- createProcess $
-    (shell [qc|g++ -std=c++11 -O2 -g {intermediateFile}|])
-    { cwd = Just buildDir }
+  let buildDir = "bin"
+  let src = [qc|{buildDir}/main.cpp|]
+  let out = [qc|{buildDir}/a.out|]
 
-  ecode <- waitForProcess gcc
-  case ecode of
-    ExitSuccess   -> return ()
-    ExitFailure _ -> error "gcc failed."
+  out %> \out -> do
+    need [src]
+    command_ [Cwd buildDir, Shell] [qc|g++ -std=c++11 -O2 -g main.cpp|] []
+
+  src %> \out -> do
+    writeFile' out (prettyPragma 80 (ppr (mkCompUnit code)))
+
+  want [out]
 
 main = do
-  compile $ do
-    mapM readStruct $ taq^.outgoingMessages
-    cmain
+  shakeArgs shakeOptions $ do
+    compile $ do
+      mapM readStruct $ taq^.outgoingMessages
+      cmain
+    want ["data/20150826TradesAndQuotesDaily.lz4"]
+    "data/*.lz4" %> \out -> do
+      let src = "/mnt/efs/ftp/tmxdatalinx.com" </> (takeFileName out) -<.> "gz"
+      need [src]
+      command [Shell] [qc|gzip -d < {src} | lz4 -9 > {out}|] []
 
