@@ -151,7 +151,7 @@ cReadIntegral ty = do
     funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
     impl = [cfun|
       $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
-        $ty:ty ret;
+        $ty:ty ret = 0;
         while (len--) {
           assert(isdigit(*buf));
           ret = ret * 10 + (*buf - '0');
