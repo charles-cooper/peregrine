@@ -16,12 +16,31 @@ import Data.List (nub, sort)
 import Data.Monoid
 
 import Control.Lens
-import Control.Monad (forM)
+import Control.Monad
+import Control.Monad.State
 
 import System.Directory
 import System.Process
 import System.Exit
 import System.IO
+
+type C a = State CompUnit a
+depends :: TopLevel a => a -> C CompUnit
+depends d = do
+  modify (<>cu)
+  return $ cu
+  where
+    cu = define d
+
+newtype Includes = Includes String
+class TopLevel a where
+  define :: a -> CompUnit
+instance TopLevel Includes where
+  define inc  = CompUnit [inc] [] []
+instance TopLevel C.Type where
+  define ty   = CompUnit [] [ty] []
+instance TopLevel C.Func where
+  define func = CompUnit [] [] [func]
 
 noloc = SrcLoc NoLoc
 
@@ -43,14 +62,14 @@ mkCsdecl :: String -> CGenTy -> C.FieldGroup
 mkCsdecl nm (SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
 mkCsdecl nm (ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$const:sz]; |]
 
-genStruct :: Message TAQ -> CompUnit
-genStruct msg = CompUnit [] [ty] []
+genStruct :: Message TAQ -> C.Type
+genStruct msg = ty
   where
     ty = [cty|
       struct $id:(msg^.msgName) {
         $sdecls:decls
       }
-      |]
+    |]
     decls = declare <$> (msg^.fields)
     declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) $ mkTy f
 
@@ -67,15 +86,19 @@ mkTy f@(Field _ len _ ty _)
   | ty==Time                 = SimpleTy uint -- assert?
   | otherwise                = error "Unknown case."
 
-readStruct :: Message TAQ -> CompUnit
-readStruct msg = CompUnit includes [] $ (concatMap readMemberDecl (msg^.fields)) ++ [impl]
+readStruct :: Message TAQ -> C CompUnit
+readStruct msg = do
+  depends $ genStruct msg
+  depends $ Includes "cstring"
+  depends =<< impl
   where
-    includes = ["cstring"]
-    impl = [cfun|
-      void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
-        $stms:stms
-      }
-    |]
+    impl = do
+      pureStms <- stms
+      return [cfun|
+        void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
+          $stms:pureStms
+        }
+      |]
     funName :: String = [qc|read_{msg^.msgName}|]
     structName        = msg^.msgName
     ofsts             = scanl (+) 0 (msg^.fields & map _len)
@@ -83,27 +106,29 @@ readStruct msg = CompUnit includes [] $ (concatMap readMemberDecl (msg^.fields))
     -- don't have a good way of grabbing all called functions.
     -- this is a crude way of stitching them in by hand.
     readMemberDecl f@(Field _ len _ ty _) = case ty of
-      Numeric -> [cReadIntegralRaw (simplety $ mkTy f)]
-      _ -> []
+      Numeric -> Just <$> cReadIntegral (simplety $ mkTy f)
+      _ -> return Nothing
 
     readMember ofst f@(Field _ len nm ty _) = case ty of
 
-      Numeric    -> [cstm|dst->$id:cnm = $id:funName(buf, $const:len); |]
+      Numeric    -> runIntegral
 
-      Alphabetic -> if len == 1
+      Alphabetic -> return $ if len == 1
                       then [cstm|dst->$id:cnm = *buf;|]
                       else [cstm|memcpy(&dst->$id:cnm, buf, $const:len);|]
 
-      Boolean    -> [cstm|dst->$id:cnm = (*buf == '1');|]
+      Boolean    -> return [cstm|dst->$id:cnm = (*buf == '1');|]
 
-      Date       -> [cstm|dst->$id:cnm = $id:funName(buf, $const:len); |]
-      Time       -> [cstm|dst->$id:cnm = $id:funName(buf, $const:len); |]
-      -- ^ Identical to numeric
+      Date       -> runIntegral
+      Time       -> runIntegral
       where
-        cnm     = rawIden (cname nm)
-        funName = getId $ cReadIntegralRaw (simplety $ mkTy f)
+        runIntegral = do
+          dep <- cReadIntegral (simplety $ mkTy f)
+          return [cstm|dst->$id:cnm = $id:(getId dep) (buf, $const:len); |]
 
-    stms = zipWith readMember ofsts (msg^.fields)
+        cnm     = rawIden (cname nm)
+
+    stms = zipWithM readMember ofsts (msg^.fields)
 
 class Identifiable a where
   getId :: a -> C.Id
@@ -113,7 +138,7 @@ instance Identifiable C.Func where
   getId (C.OldFunc _ iden _ _ _ _ _) = iden
 
 data CompUnit = CompUnit
-  { includes  :: [String]
+  { includes  :: [Includes]
   , typedecls :: [C.Type]
   , functions :: [C.Func]
   }
@@ -123,40 +148,42 @@ instance Monoid CompUnit where
   mappend (CompUnit a b c) (CompUnit a' b' c') =
     CompUnit (a<>a') (b<>b') (c<>c')
 
-mkCompUnit :: CompUnit -> [C.Definition]
-mkCompUnit (CompUnit includes types funcs) = [cunit|
+mkCompUnit :: C a -> [C.Definition]
+mkCompUnit code = [cunit|
     /* Includes */
-    $edecls:(nub $ sort $ include <$> includes)
+    $edecls:(nub $ sort $ include <$> incls)
 
     /* Types */
-    $edecls:(typedecl <$> nub types)
+    $edecls:(typedecl <$> nub tys)
 
     /* Functions */
     $edecls:(fundecl <$> nub funcs)
   |]
   where
-    include (header :: String) = C.EscDef [qc|#include <{header}>|] noloc
+    include (Includes header)  = C.EscDef [qc|#include <{header}>|] noloc
     typedecl ty                = C.DecDef [cdecl|$ty:ty;|] noloc
     fundecl func               = C.FuncDef func noloc
+    (CompUnit incls tys funcs) = execState code mempty
 
-cReadIntegral ty = CompUnit ["cstdint", "cassert", "cctype"]
-                            []
-                            [cReadIntegralRaw ty]
-cReadIntegralRaw ty = [cfun|
-  $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
-    $ty:ty ret;
-    while (len--) {
-      assert(isdigit(*buf));
-      ret = ret * 10 + (*buf - '0');
-      ++buf;
-    }
-    return ret;
-  }
-  |]
+cReadIntegral ty = do
+  mapM (depends . Includes) ["cstdint", "cassert", "cctype"]
+  depends impl
+  return impl
   where
     funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
+    impl = [cfun|
+      $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
+        $ty:ty ret;
+        while (len--) {
+          assert(isdigit(*buf));
+          ret = ret * 10 + (*buf - '0');
+          ++buf;
+        }
+        return ret;
+      }
+    |]
 
-cmain = CompUnit [] [] $ pure [cfun|int main() {} |]
+cmain = depends [cfun|int main() {} |]
 
 ----------------------------
 -- Compilation
@@ -165,7 +192,7 @@ cmain = CompUnit [] [] $ pure [cfun|int main() {} |]
 getBuildDir :: IO FilePath
 getBuildDir = (++"/bin") <$> getCurrentDirectory
 
-compile :: CompUnit -> IO ()
+compile :: C a -> IO ()
 compile code = do
   buildDir <- getBuildDir
   createDirectoryIfMissing False buildDir
@@ -182,7 +209,7 @@ compile code = do
     ExitFailure _ -> error "gcc failed."
 
 main = do
-  compile $ cReadIntegral uint
-    <> (mconcat $ genStruct <$> taq^.outgoingMessages)
-    <> (mconcat $ readStruct <$> taq^.outgoingMessages)
-    <> cmain
+  compile $ do
+    mapM readStruct $ taq^.outgoingMessages
+    cmain
+
