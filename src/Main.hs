@@ -8,7 +8,7 @@ import Protocol
 import Language.C.Quote.C
 import Language.C.Smart ()
 import qualified Language.C.Syntax as C
-import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty)
+import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
 import Text.InterpolatedString.Perl6 (qc)
 import Data.Loc (SrcLoc(..), Loc(..))
 
@@ -26,7 +26,7 @@ import System.IO
 noloc = SrcLoc NoLoc
 
 char   = [cty|char|]
-uchar  = [cty|typedef unsigned char uint8_t|]
+uchar  = [cty|typename uint8_t|]
 bool   = [cty|typename bool|]
 ushort = [cty|typename uint16_t|]
 uint   = [cty|typename uint32_t|]
@@ -35,7 +35,15 @@ ulong  = [cty|typename uint64_t|]
 assert :: Bool -> a -> a
 assert pred a = if pred then a else (error "Assertion failed")
 
-genStruct :: Message TAQ -> CompUnit -- C.Type
+-- TODO put this in an 'import as C' module
+data CGenTy = ArrayTy  { arrayty :: C.Type, arraysize :: Int }
+            | SimpleTy { simplety :: C.Type }
+
+mkCsdecl :: String -> CGenTy -> C.FieldGroup
+mkCsdecl nm (SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
+mkCsdecl nm (ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$const:sz]; |]
+
+genStruct :: Message TAQ -> CompUnit
 genStruct msg = CompUnit [] [ty] []
   where
     ty = [cty|
@@ -43,36 +51,73 @@ genStruct msg = CompUnit [] [ty] []
         $sdecls:decls
       }
       |]
-    decls = mkDecl <$> (msg^.fields)
-    mkDecl f@(Field _ len nm ty notes)
-      | ty==Numeric    && len==9 = [csdecl|$ty:uint   $id:cnm;|]
-      | ty==Numeric    && len==7 = [csdecl|$ty:uint   $id:cnm;|]
-      | ty==Numeric    && len==3 = [csdecl|$ty:ushort $id:cnm;|]
-      | ty==Numeric              = error $ "Unknown integer len for " ++ show f
-      | ty==Alphabetic && len==1 = [csdecl|$ty:char   $id:cnm;|]
-      | ty==Alphabetic           = [csdecl|$ty:char   $id:cnm[$const:len];|]
-      | ty==Boolean              = assert (len==1) [csdecl|$ty:bool $id:cnm;|]
-      | ty==Date                 = [csdecl|$ty:uint   $id:cnm;|]
-      | ty==Time                 = [csdecl|$ty:uint   $id:cnm;|]
-      where
-        cnm = rawIden (cname nm)
+    decls = declare <$> (msg^.fields)
+    declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) $ mkTy f
+
+mkTy :: Field TAQ -> CGenTy
+mkTy f@(Field _ len _ ty _)
+  | ty==Numeric    && len==9 = SimpleTy uint
+  | ty==Numeric    && len==7 = SimpleTy uint
+  | ty==Numeric    && len==3 = SimpleTy ushort
+  | ty==Numeric              = error $ "Unknown integer len for " ++ show f
+  | ty==Alphabetic && len==1 = SimpleTy char
+  | ty==Alphabetic           = ArrayTy char len
+  | ty==Boolean              = assert (len==1) $ SimpleTy bool
+  | ty==Date                 = SimpleTy uint -- assert?
+  | ty==Time                 = SimpleTy uint -- assert?
+  | otherwise                = error "Unknown case."
 
 readStruct :: Message TAQ -> CompUnit
-readStruct msg = CompUnit [] [] $ pure [cfun|
-    void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
-      /* TODO */
-      return ;
-    }
-  |]
+readStruct msg = CompUnit includes [] $ (concatMap readMemberDecl (msg^.fields)) ++ [impl]
   where
+    includes = ["cstring"]
+    impl = [cfun|
+      void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
+        $stms:stms
+      }
+    |]
     funName :: String = [qc|read_{msg^.msgName}|]
     structName        = msg^.msgName
+    ofsts             = scanl (+) 0 (msg^.fields & map _len)
+
+    -- don't have a good way of grabbing all called functions.
+    -- this is a crude way of stitching them in by hand.
+    readMemberDecl f@(Field _ len _ ty _) = case ty of
+      Numeric -> [cReadIntegralRaw (simplety $ mkTy f)]
+      _ -> []
+
+    readMember ofst f@(Field _ len nm ty _) = case ty of
+
+      Numeric    -> [cstm|dst->$id:cnm = $id:funName(buf, $const:len); |]
+
+      Alphabetic -> if len == 1
+                      then [cstm|dst->$id:cnm = *buf;|]
+                      else [cstm|memcpy(&dst->$id:cnm, buf, $const:len);|]
+
+      Boolean    -> [cstm|dst->$id:cnm = (*buf == '1');|]
+
+      Date       -> [cstm|dst->$id:cnm = $id:funName(buf, $const:len); |]
+      Time       -> [cstm|dst->$id:cnm = $id:funName(buf, $const:len); |]
+      -- ^ Identical to numeric
+      where
+        cnm     = rawIden (cname nm)
+        funName = getId $ cReadIntegralRaw (simplety $ mkTy f)
+
+    stms = zipWith readMember ofsts (msg^.fields)
+
+class Identifiable a where
+  getId :: a -> C.Id
+
+instance Identifiable C.Func where
+  getId (C.Func _ iden _ _ _ _)      = iden
+  getId (C.OldFunc _ iden _ _ _ _ _) = iden
 
 data CompUnit = CompUnit
   { includes  :: [String]
   , typedecls :: [C.Type]
   , functions :: [C.Func]
   }
+
 instance Monoid CompUnit where
   mempty = CompUnit [] [] []
   mappend (CompUnit a b c) (CompUnit a' b' c') =
@@ -84,17 +129,20 @@ mkCompUnit (CompUnit includes types funcs) = [cunit|
     $edecls:(nub $ sort $ include <$> includes)
 
     /* Types */
-    $edecls:(typedecl <$> types)
+    $edecls:(typedecl <$> nub types)
 
     /* Functions */
-    $edecls:(fundecl <$> funcs)
+    $edecls:(fundecl <$> nub funcs)
   |]
   where
     include (header :: String) = C.EscDef [qc|#include <{header}>|] noloc
     typedecl ty                = C.DecDef [cdecl|$ty:ty;|] noloc
     fundecl func               = C.FuncDef func noloc
 
-cReadIntegral ty = CompUnit ["cstdint", "cassert", "cctype"] [] $ pure [cfun|
+cReadIntegral ty = CompUnit ["cstdint", "cassert", "cctype"]
+                            []
+                            [cReadIntegralRaw ty]
+cReadIntegralRaw ty = [cfun|
   $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
     $ty:ty ret;
     while (len--) {
@@ -122,7 +170,7 @@ compile code = do
   buildDir <- getBuildDir
   createDirectoryIfMissing False buildDir
   let intermediateFile = [qc|{buildDir}/main.cpp|]
-  writeFile intermediateFile $ pretty 80 (ppr (mkCompUnit code))
+  writeFile intermediateFile $ prettyPragma 80 (ppr (mkCompUnit code))
 
   (_, _, _, gcc) <- createProcess $
     (shell [qc|g++ -std=c++11 -O2 -g {intermediateFile}|])
