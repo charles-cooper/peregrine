@@ -38,6 +38,11 @@ ushort = [cty|typename uint16_t|]
 uint   = [cty|typename uint32_t|]
 ulong  = [cty|typename uint64_t|]
 
+cppstr :: C (C.Type)
+cppstr = do
+  include "string"
+  return [cty|typename $id:("std::string")|]
+
 assert :: Bool -> a -> a
 assert pred a = if pred then a else (error "Assertion failed")
 
@@ -130,7 +135,10 @@ instance Identifiable C.Type where
 mkCompUnit :: C a -> [C.Definition]
 mkCompUnit code = [cunit|
     /* Includes */
-    $edecls:(nub $ sort $ include <$> incls)
+    $edecls:(nub $ include <$> incls)
+
+    /* Other definitions */
+    $edecls:(nub $ defs)
 
     /* Types */
     $edecls:(typedecl <$> nub tys)
@@ -147,7 +155,7 @@ mkCompUnit code = [cunit|
     typedecl ty                  = [cedecl|$ty:ty;|]
     fundecl func                 = [cedecl|$func:func|]
     declare decl                 = [cedecl|$decl:decl;|]
-    (C.CompUnit incls tys funcs decls) = C.getCompUnit code
+    (C.CompUnit incls defs tys funcs decls) = C.getCompUnit code
 
 cReadIntegral ty = do
   mapM include ["cstdint", "cassert", "cctype"]
@@ -236,12 +244,6 @@ mainLoop = do
 fdName :: Message a -> String
 fdName msg = rawIden $ cname $ _msgName msg
 
-{-
-declareMsg :: Message a -> C C.InitGroup
-declareMsg msg = do
-  depends $ genStruct msg
--}
-
 initMsg :: Message a -> C C.Stm
 initMsg msg = do
   mapM include
@@ -293,35 +295,43 @@ initMsg msg = do
       }
     }
   }|]
-  return [cstm|$id:(fdName msg) =
-    spawn_child($(outputName :: String), $codecStr, $(codecStr ++ auxName));|]
+  str <- require cppstr
+  let mkStr = [cexp|$id:("std::string")|]
+  return [cstm|{
+    $ty:str filename = $mkStr("out/")
+        + $mkStr(argv[1]) + $mkStr($(outputName++""));
+    $id:(fdName msg) =
+      spawn_child(filename.c_str(), $codecStr, $(codecStr ++ auxName));
+    }|]
   where
-    outputName = [qc|data/{fdName msg}.{suffix}|]
+    outputName = [qc|.{fdName msg}.{suffix}|]
     auxName    = [qc| ({fdName msg})|]
     suffix     = "gz"
     codecStr   = "gzip"
+
+require = id
 
 cleanupMsg :: Message a -> C [C.Stm]
 cleanupMsg msg = do
   initMsg msg -- pull dependencies
   return [cstms|close  ($id:(fdName msg).writefd);
-              /* don't wait for them. strange hang occurs. */
-              /* this way though there is a small race condition between */
-              /* when the parent finishes and when the gzip children finish. */
-              /* fprintf(stderr, "Waiting %d\n", $id:(fdName msg).pid); */
-              /* waitpid($id:(fdName msg).pid, NULL, 0); */
+              /* don't wait for them or else strange hang occurs.
+               * without waiting, there is a small race condition between
+               * when the parent finishes and when the gzip children finish.
+               * fprintf(stderr, "Waiting %d\n", $id:(fdName msg).pid);
+               * waitpid($id:(fdName msg).pid, NULL, 0); */
                 ;
         |]
 
 cmain :: C C.Func
 cmain = do
   include "cstdio"
-  loopStep    <- mainLoop
-  initMsgs    <- initMsg `mapM` _outgoingMessages taq
-  cleanupMsgs <- cleanupMsg `mapM` _outgoingMessages taq
+  loopStep     <- mainLoop
+  outputPrefix <- topDecl [cdecl|char const *outputPrefix;|]
+  initMsgs     <- initMsg `mapM` _outgoingMessages taq
+  cleanupMsgs  <- cleanupMsg `mapM` _outgoingMessages taq
 
-  depends [cfun|int main() {
-
+  depends [cfun|int main(int argc, char **argv) {
     $stms:(initMsgs)
     char buf[$bufLen];
     int ret = 0;
@@ -359,7 +369,7 @@ compile code = do
 
   src %> \out -> do
     alwaysRerun
-    writeFileChanged out (prettyPragma 80 (ppr (mkCompUnit code)))
+    writeFileChanged out (pretty 80 (ppr (mkCompUnit code)))
 
   out %> \out -> do
 
@@ -376,16 +386,19 @@ main = do
 
     compile cmain
 
+    let exe = "bin/a.out"
+
     "data/*.lz4" %> \out -> do
       let src = "/mnt/efs/ftp/tmxdatalinx.com" </> (takeFileName out) -<.> "gz"
       need [src]
       command [Shell] [qc|gzip -d < {src} | lz4 -9 > {out}|] []
 
+    let date = "20150826"
     phony "Run a.out" $ do
-      let dataFile = "data/20150826TradesAndQuotesDaily.lz4"
-      let exe = "bin/a.out"
+      let dataFile = [qc|data/{date}TradesAndQuotesDaily.lz4|]
       need [dataFile, exe]
-      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe}|] []
-    want ["Run a.out"]
+      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
+
+    want ["bin/a.out"]
 
 

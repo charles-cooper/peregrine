@@ -1,7 +1,10 @@
 .stack-work
 .shake
+
 bin
 data
+out
+
 default.nix
 result
 core

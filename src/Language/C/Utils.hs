@@ -19,15 +19,16 @@ import Data.Monoid
 
 data CompUnit = CompUnit
   { includes  :: [Includes]
+  , decls     :: [C.Definition] -- useful for inserting raw C++ declarations
   , typedecls :: [C.Type]
   , functions :: [C.Func]
   , topLevel  :: [C.InitGroup]
   }
 
 instance Monoid CompUnit where
-  mempty = CompUnit [] [] [] []
-  mappend (CompUnit a b c d) (CompUnit a' b' c' d') =
-    CompUnit (a<>a') (b<>b') (c<>c') (d<>d')
+  mempty = CompUnit [] [] [] [] []
+  mappend (CompUnit a b c d e) (CompUnit a' b' c' d' e') =
+    CompUnit (a<>a') (b<>b') (c<>c') (d<>d') (e<>e')
 
 type C a = State CompUnit a
 depends :: TopLevel a => a -> C a
@@ -49,13 +50,15 @@ newtype Includes = Includes String deriving (Eq, Ord, Show)
 class TopLevel a where
   define :: a -> CompUnit
 instance TopLevel Includes where
-  define inc  = CompUnit [inc] [] [] []
+  define inc  = CompUnit [inc] [] [] [] []
+instance TopLevel C.Definition where
+  define def  = CompUnit [] [def] [] [] []
 instance TopLevel C.Type where
-  define ty   = CompUnit [] [ty] [] []
+  define ty   = CompUnit [] [] [ty] [] []
 instance TopLevel C.Func where
-  define func = CompUnit [] [] [func] []
+  define func = CompUnit [] [] [] [func] []
 instance TopLevel C.InitGroup where
-  define init = CompUnit [] [] [] [init]
+  define init = CompUnit [] [] [] [] [init]
 
 noloc :: SrcLoc
 noloc = SrcLoc NoLoc
