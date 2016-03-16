@@ -1,3 +1,5 @@
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 module Language.C.Utils (
   C,
   GType(..),
@@ -5,17 +7,24 @@ module Language.C.Utils (
   CompUnit(..),
   depends,
   include,
+  require,
   topDecl,
   noloc,
-  getCompUnit
+  getCompUnit,
+  mkCompUnit,
+  Identifiable(..),
 ) where
 
+import           Language.C.Quote.C
 import qualified Language.C.Syntax as C
+
+import Text.InterpolatedString.Perl6 (qc)
 
 import Data.Loc (SrcLoc(..), Loc(..))
 
 import Control.Monad.State
 import Data.Monoid
+import Data.List (nub)
 
 data CompUnit = CompUnit
   { includes  :: [Includes]
@@ -35,6 +44,10 @@ depends :: TopLevel a => a -> C a
 depends d = do
   modify (<>define d)
   return d
+
+-- another way of saying 'id'
+require :: C a -> C a
+require = id
 
 -- monomorphic version of depends for top-level declarations
 topDecl :: C.InitGroup -> C C.InitGroup
@@ -68,4 +81,44 @@ noloc = SrcLoc NoLoc
 -- then compile to C AST
 data GType = ArrayTy  { arrayty :: C.Type, arraysize :: Int }
            | SimpleTy { simplety :: C.Type }
+
+mkCompUnit :: C a -> [C.Definition]
+mkCompUnit code = [cunit|
+    /* Includes */
+    $edecls:(nub $ include <$> incls)
+ 
+    /* Other definitions */
+    $edecls:(nub $ defs)
+ 
+    /* Types */
+    $edecls:(typedecl <$> nub tys)
+ 
+    /* Top level declarations */
+    $edecls:(declare <$> nub decls)
+ 
+    /* Functions */
+    $edecls:(fundecl <$> nub funcs)
+  |]
+  where
+    includeStr header          = [qc|#include <{header::String}>|]
+    include (Includes header)  = [cedecl|$esc:(includeStr header)|]
+    typedecl ty                = [cedecl|$ty:ty;|]
+    fundecl func               = [cedecl|$func:func|]
+    declare decl               = [cedecl|$decl:decl;|]
+    (CompUnit incls defs tys funcs decls) = getCompUnit code
+
+class Identifiable a where
+  getId :: a -> C.Id
+
+instance Identifiable C.Func where
+  getId (C.Func _ iden _ _ _ _)      = iden
+  getId (C.OldFunc _ iden _ _ _ _ _) = iden
+-- thi sisn't exactly right ..
+instance Identifiable C.Type where
+  getId t@(C.Type (C.DeclSpec _ _ ty _) _ _) = case ty of
+    C.Tstruct (Just id) _ _ _ -> id
+    C.Tunion  (Just id) _ _ _ -> id
+    C.Tenum   (Just id) _ _ _ -> id
+    _ -> error $ "Not identifiable: " ++ show t
+  getId t = error $ "Not identifiable: " ++ show t
 
