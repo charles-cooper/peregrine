@@ -10,6 +10,7 @@ import           Language.C.Smart ()
 import qualified Language.C.Syntax as C
 import qualified Language.C.Utils as C
 import           Language.C.Utils (C, CompUnit, depends, include, noloc)
+import           Language.C.Utils (topDecl)
 
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
 import Text.InterpolatedString.Perl6 (qc)
@@ -134,14 +135,19 @@ mkCompUnit code = [cunit|
     /* Types */
     $edecls:(typedecl <$> nub tys)
 
+    /* Top level declarations */
+    $edecls:(declare <$> nub decls)
+
     /* Functions */
     $edecls:(fundecl <$> nub funcs)
   |]
   where
-    include (C.Includes header)  = C.EscDef [qc|#include <{header}>|] noloc
-    typedecl ty                  = C.DecDef [cdecl|$ty:ty;|] noloc
-    fundecl func                 = C.FuncDef func noloc
-    (C.CompUnit incls tys funcs) = C.getCompUnit code
+    include (C.Includes header)  = [cedecl|$esc:includeStr|]
+      where includeStr = [qc|#include <{header}>|]
+    typedecl ty                  = [cedecl|$ty:ty;|]
+    fundecl func                 = [cedecl|$func:func|]
+    declare decl                 = [cedecl|$decl:decl;|]
+    (C.CompUnit incls tys funcs decls) = C.getCompUnit code
 
 cReadIntegral ty = do
   mapM include ["cstdint", "cassert", "cctype"]
@@ -184,13 +190,25 @@ mainLoop = do
     struct <- depends $ genStruct msg
     let prefix = [cexp|msg.$id:(getId struct)|]
     let printf = printFmt prefix msg
+
     return [cstm|case $exp:(_tag msg) : {
-      if (fread(buf, 1, $(msgLen msg + 1), stdin) < 0) {
+
+      // read bytes
+      if (fread(buf, 1, $(msgLen msg + 1), stdin) == 0) {
         return -1;
       }
+
+      // parse struct
       $id:(getId readMsg) (&msg.$id:(getId struct), buf);
-      printf($(fst printf ++ "\n"), $args:(snd printf));
+
+      // write struct
+      write($id:(fdName msg).writefd,
+          &msg.$id:(getId struct),
+          sizeof(struct $id:(getId struct)));
+
+      /*printf($(fst printf ++ "\n"), $args:(snd printf));*/
       break;
+
     }|]
   structs <- forM (_outgoingMessages taq) $ \msg -> do
     struct <- depends $ genStruct msg
@@ -201,7 +219,7 @@ mainLoop = do
       union {
         $sdecls:structs
       } msg;
-      if (fread(buf, 1, 1, stdin) < 1) {
+      if (fread(buf, 1, 1, stdin) == 0) {
         return -1;
       }
       switch (*buf) {
@@ -215,22 +233,115 @@ mainLoop = do
     }
   |]
 
+fdName :: Message a -> String
+fdName msg = rawIden $ cname $ _msgName msg
+
+{-
+declareMsg :: Message a -> C C.InitGroup
+declareMsg msg = do
+  depends $ genStruct msg
+-}
+
+initMsg :: Message a -> C C.Stm
+initMsg msg = do
+  mapM include
+    ["cstdio", "cstdlib", "unistd.h", "sys/types.h", "sys/wait.h", "fcntl.h"]
+  depends [cty|struct spawn { int writefd; int pid; }|]
+  topDecl [cdecl|struct spawn $id:(fdName msg);|]
+  depends [cfun|struct spawn spawn_child(char const *filename, char const *progname, char const *argv0) {
+    int fds[2];
+    int ret;
+    if ((ret = pipe(fds)) < 0) {
+      perror("pipe");
+      exit(ret);
+    }
+    int readfd  = fds[0];
+    int writefd = fds[1];
+
+    int cpid = fork();
+    if (cpid < 0) {
+      perror("fork");
+      exit(1);
+    }
+    /* parent */
+    if (cpid) {
+      close(readfd);
+      struct spawn ret;
+      ret.writefd = writefd;
+      ret.pid     = cpid;
+      return ret;
+    } else {
+      close(writefd);
+      /* stdin from pipe */
+      if ((ret = dup2(readfd, STDIN_FILENO)) < 0) {
+        perror("dup2");
+        exit(ret);
+      }
+      int outfd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+      if (outfd < 0) {
+        perror("open output");
+        exit(outfd);
+      }
+      /* pipe to file */
+      if ((ret = dup2(outfd, STDOUT_FILENO)) < 0) {
+        perror("dup2");
+        exit(ret);
+      }
+      if ((ret = execlp(progname, argv0, 0)) < 0) {
+        perror("execlp");
+        exit(ret);
+      }
+    }
+  }|]
+  return [cstm|$id:(fdName msg) =
+    spawn_child($(outputName :: String), $codecStr, $(codecStr ++ auxName));|]
+  where
+    outputName = [qc|data/{fdName msg}.{suffix}|]
+    auxName    = [qc| ({fdName msg})|]
+    suffix     = "gz"
+    codecStr   = "gzip"
+
+cleanupMsg :: Message a -> C [C.Stm]
+cleanupMsg msg = do
+  initMsg msg -- pull dependencies
+  return [cstms|close  ($id:(fdName msg).writefd);
+              /* don't wait for them. strange hang occurs. */
+              /* this way though there is a small race condition between */
+              /* when the parent finishes and when the gzip children finish. */
+              /* fprintf(stderr, "Waiting %d\n", $id:(fdName msg).pid); */
+              /* waitpid($id:(fdName msg).pid, NULL, 0); */
+                ;
+        |]
+
 cmain :: C C.Func
 cmain = do
   include "cstdio"
-  runMain <- mainLoop
+  loopStep    <- mainLoop
+  initMsgs    <- initMsg `mapM` _outgoingMessages taq
+  cleanupMsgs <- cleanupMsg `mapM` _outgoingMessages taq
+
   depends [cfun|int main() {
+
+    $stms:(initMsgs)
     char buf[$bufLen];
     int ret = 0;
     int pkts = 0;
+
     while(ret >= 0) {
-      ret = $id:(getId runMain) (buf);
+      ret = $id:(getId loopStep) (buf);
       ++pkts;
+      if (pkts % 1000000 == 0) {
+        fprintf(stderr, "Checkpoint! %d\n", pkts);
+      }
     }
-    printf("%d\n", pkts);
+
+    fprintf(stderr, "Cleaning up.\n");
+    $stms:(concat cleanupMsgs)
+    fprintf(stderr, "%d packets\n", pkts);
+
   }|]
   where
-    bufLen = maximum $ foreach (_outgoingMessages taq) $
+    bufLen     = maximum $ foreach (_outgoingMessages taq) $
       rotateL (1::Int) . (+1) . logBase2 . msgLen
 
     logBase2 x = finiteBitSize x - 1 - countLeadingZeros x
@@ -274,7 +385,7 @@ main = do
       let dataFile = "data/20150826TradesAndQuotesDaily.lz4"
       let exe = "bin/a.out"
       need [dataFile, exe]
-      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} | head -n100 |] []
+      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe}|] []
     want ["Run a.out"]
 
 
