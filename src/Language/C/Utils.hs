@@ -13,6 +13,12 @@ module Language.C.Utils (
   getCompUnit,
   mkCompUnit,
   Identifiable(..),
+
+  char,
+  bool,
+  ushort,
+  uint,
+  ulong,
 ) where
 
 import           Language.C.Quote.C
@@ -25,6 +31,13 @@ import Data.Loc (SrcLoc(..), Loc(..))
 import Control.Monad.State
 import Data.Monoid
 import Data.List (nub)
+
+char   = [cty|char|]
+uchar  = [cty|typename uint8_t|]
+bool   = [cty|typename bool|]
+ushort = [cty|typename uint16_t|]
+uint   = [cty|typename uint32_t|]
+ulong  = [cty|typename uint64_t|]
 
 data CompUnit = CompUnit
   { includes  :: [Includes]
@@ -87,11 +100,11 @@ mkCompUnit code = [cunit|
     /* Includes */
     $edecls:(nub $ include <$> incls)
  
-    /* Other definitions */
-    $edecls:(nub $ defs)
- 
     /* Types */
     $edecls:(typedecl <$> nub tys)
+ 
+    /* Other definitions */
+    $edecls:(nub $ defs)
  
     /* Top level declarations */
     $edecls:(declare <$> nub decls)

@@ -20,23 +20,24 @@ import           Utils
 import           Control.Monad
 
 data Specification a = Specification
-  { _mkTy       :: Field a -> C.GType
+  { _mkTy       :: Field a -> C C.GType
   , _readMember :: Int -> Field a -> C C.Stm
   , _handleMsg  :: Message a -> C C.Stm
   , _initMsg    :: Message a -> C C.Stm
   , _cleanupMsg :: Message a -> C C.Stm
   }
 
-genStruct :: (Field a -> C.GType) -> Message a -> C.Type
-genStruct mkTy msg = ty
-  where
-    ty = [cty|
+genStruct :: (Field a -> C C.GType) -> Message a -> C C.Type
+genStruct mkTy msg = do
+  decls <- runDecls
+  depends [cty|
       struct $id:(_msgName msg) {
         $sdecls:decls
       }
     |]
-    decls = declare <$> (_fields msg)
-    declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) $ mkTy f
+  where
+    runDecls = mapM declare (_fields msg)
+    declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) <$> mkTy f
 
 mkCsdecl :: String -> C.GType -> C.FieldGroup                                   
 mkCsdecl nm (C.SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
@@ -45,7 +46,7 @@ mkCsdecl nm (C.ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$sz]; |]
 readStruct :: Specification a -> Message a -> C C.Func
 readStruct spec@(Specification {..}) msg = do
   include "cstring"
-  depends (genStruct _mkTy msg)
+  require (genStruct _mkTy msg)
   require impl
   where
     impl = do
@@ -65,27 +66,26 @@ mainLoop spec@(Specification {..}) proto = do
   include "stdio.h"
   cases <- forM (_outgoingMessages proto) $ \msg -> do
     readMsg   <- readStruct spec msg
-    struct    <- depends $ genStruct _mkTy msg
+    struct    <- require $ genStruct _mkTy msg
     handleMsg <- _handleMsg msg
     let prefix = [cexp|msg.$id:(getId struct)|]
  
     return [cstm|case $exp:(_tag msg) : {
  
-      // read bytes
+      /* read bytes */
       if (fread(buf, 1, $(bodyLen proto msg), stdin) == 0) {
         return -1;
       }
-      // parse struct
+      /* parse struct */
       $id:(getId readMsg) (&msg.$id:(getId struct), buf);
  
-      // handle struct
       $stm:(handleMsg)
  
       break;
  
     }|]
   structs <- forM (_outgoingMessages proto) $ \msg -> do
-    struct <- depends $ genStruct _mkTy msg
+    struct <- require $ genStruct _mkTy msg
     return [csdecl|struct $id:(getId struct) $id:(getId struct);|]
  
   depends [cfun|

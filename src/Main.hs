@@ -7,72 +7,145 @@ import Protocol
 import Protocol.Backend.C.Base as C
 
 import           Language.C.Quote.C
-import           Language.C.Smart ()
 import qualified Language.C.Syntax as C
 import qualified Language.C.Utils as C
+import           Language.C.Smart ((+=))
 import           Language.C.Utils (C, CompUnit, depends, include, noloc)
 import           Language.C.Utils (topDecl, require)
+import           Language.C.Utils (char, bool, ushort, uint, ulong)
 
-import Data.List (intercalate)
+import Data.List (intercalate, sort)
+import Data.Maybe (listToMaybe)
+import Data.Char (isSpace)
 
-import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
-import Text.InterpolatedString.Perl6 (qc)
+import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma, Pretty(..))
+import Text.InterpolatedString.Perl6 (q, qc)
+
+import Data.Text as T (unpack)
 
 import Utils
-
-import System.Directory
-import System.Process
-import System.Exit
-import System.IO
 
 import Development.Shake
 import Development.Shake.FilePath
 
-char   = [cty|char|]
-uchar  = [cty|typename uint8_t|]
-bool   = [cty|typename bool|]
-ushort = [cty|typename uint16_t|]
-uint   = [cty|typename uint32_t|]
-ulong  = [cty|typename uint64_t|]
+import System.IO.Unsafe (unsafePerformIO)
 
 taqCSpec :: C.Specification TAQ
 taqCSpec = C.Specification
   { _mkTy       = mkTy
   , _readMember = readMember
-  , _handleMsg  = handleMsg
-  , _initMsg    = initMsg
-  , _cleanupMsg = cleanupMsg
+  , _handleMsg  = handleMsgGroupBy
+  , _initMsg    = initMsgGroupBy
+  , _cleanupMsg = cleanupMsgGroupBy
   }
 
-handleMsg :: Message TAQ -> C C.Stm
-handleMsg msg = do
-  struct <- depends $ genStruct mkTy msg
+-- shamelessly taken from neat-interpolation
+dedent :: String -> String
+dedent s = case minimumIndent s of
+  Just len -> unlines $ map (drop len) $ lines s
+  Nothing  -> s
+  where
+    minimumIndent = listToMaybe . sort . map (length . takeWhile (==' '))
+      . filter (not . null . dropWhile isSpace) . lines
+
+noop :: C.Stm
+noop = [cstm|/*no-op*/(void)0;|]
+
+initMsgGroupBy :: Message TAQ -> C C.Stm
+initMsgGroupBy msg = pure noop
+
+handleMsgGroupBy = handleMsgGroupBy__ (+=) (getField id "Symbol" taq "trade")
+
+handleMsgGroupBy__ :: (C.Exp -> C.Exp -> C.Stm) -> Field TAQ -> Message TAQ -> C C.Stm
+handleMsgGroupBy__ mkStmt field msg = case _msgName msg of
+  "trade" -> do
+    symbol <- C.simplety <$> mkTy field
+    let price = uint
+    cppmap <- cpp_unordered_map symbol price
+    topDecl [cdecl|$ty:cppmap groupby;|]
+    return $ mkStmt [cexp|groupby[msg.trade.symbol]|] [cexp|msg.trade.price|]
+  _ -> pure noop
+
+trace :: Show a => a -> a
+trace a = unsafePerformIO $ print a >> return a
+
+showc :: Pretty c => c -> String
+showc = pretty 0 . ppr
+
+cleanupMsgGroupBy :: Message TAQ -> C C.Stm
+cleanupMsgGroupBy msg = case _msgName msg of
+  "trade" -> pure [cstm|
+    for ($ty:auto it = groupby.begin(); it != groupby.end(); ++it) {
+      printf("%.8s %d\n", &it->first, it->second);
+    }|]
+  _ -> pure noop
+  where
+    auto = [cty|typename $id:("auto")|]
+
+handleMsgGzip :: Message TAQ -> C C.Stm
+handleMsgGzip msg = do
+  struct <- require $ genStruct mkTy msg
   return [cstm|write($id:(fdName msg).writefd,
           &msg.$id:(C.getId struct),
           sizeof(struct $id:(C.getId struct)));|]
   where
     cnm = rawIden . cname . _msgName
 
-cppstr :: C (C.Type)
-cppstr = do
+cpp_string :: C C.Type
+cpp_string = do
   include "string"
   return [cty|typename $id:("std::string")|]
+
+cpp_unordered_map :: C.Type -> C.Type -> C C.Type
+cpp_unordered_map k v = do
+  include "unordered_map"
+  return [cty|typename $id:ty|]
+  where
+    ty :: String = [qc|std::unordered_map<{showc k}, {showc v}>|]
+    -- sk           = tostr k
+    -- sv           = tostr v
 
 assert :: Bool -> a -> a
 assert pred a = if pred then a else (error "Assertion failed")
 
-mkTy :: Field TAQ -> C.GType
-mkTy f@(Field _ len _ ty _)
-  | ty==Numeric    && len==9 = C.SimpleTy uint
-  | ty==Numeric    && len==7 = C.SimpleTy uint
-  | ty==Numeric    && len==3 = C.SimpleTy ushort
-  | ty==Numeric              = error $ "Unknown integer len for " ++ show f
-  | ty==Alphabetic && len==1 = C.SimpleTy char
-  | ty==Alphabetic           = C.ArrayTy char len
-  | ty==Boolean              = assert (len==1) $ C.SimpleTy bool
-  | ty==Date                 = C.SimpleTy uint -- assert?
-  | ty==Time                 = C.SimpleTy uint -- assert?
-  | otherwise                = error "Unknown case."
+symbol :: C C.Type
+symbol = do
+  hash <- depends [cedecl|$esc:esc|]
+  depends [cty|struct symbol { $ty:ulong symbol; }|]
+  return [cty|typename $id:("struct symbol")|]
+  where
+    esc = dedent [q|
+      namespace std {
+        template <> struct hash<struct symbol> {
+          uint64_t operator()(const struct symbol& k) const {
+            return hash<uint64_t>()(k.symbol);
+          }
+        };
+        template <> struct equal_to<struct symbol> {
+          bool operator() (const struct symbol& x, const struct symbol& y)
+            const
+          {
+            return equal_to<uint64_t>()(x.symbol, y.symbol);
+          }
+        };
+      }
+    |]
+
+mkTy :: Field TAQ -> C C.GType
+mkTy f@(Field _ len _ ty _) = do
+  symbol__ <- require symbol
+  let ret
+        | ty==Numeric    && len==9 = C.SimpleTy uint
+        | ty==Numeric    && len==7 = C.SimpleTy uint
+        | ty==Numeric    && len==3 = C.SimpleTy ushort
+        | ty==Numeric              = error $ "Unknown integer len for " ++ show f
+        | ty==Alphabetic && len==1 = C.SimpleTy char
+        | ty==Alphabetic           = C.SimpleTy symbol__
+        | ty==Boolean              = assert (len==1) $ C.SimpleTy bool
+        | ty==Date                 = C.SimpleTy uint -- assert?
+        | ty==Time                 = C.SimpleTy uint -- assert?
+        | otherwise                = error "Unknown case."
+  return ret
 
 readMember ofst f@(Field _ len nm ty _) = case ty of
 
@@ -86,7 +159,7 @@ readMember ofst f@(Field _ len nm ty _) = case ty of
   where
     buf = [cexp|buf + $ofst|]
     runIntegral = do
-      dep <- cReadIntegral (C.simplety $ mkTy f)
+      dep <- cReadIntegral =<< (C.simplety <$> mkTy f)
       return [cstm|dst->$id:cnm = $id:(C.getId dep) ($buf, $len); |]
 
     cnm     = rawIden (cname nm)
@@ -124,8 +197,9 @@ printFmt root msg = let
 fdName :: Message a -> String
 fdName msg = rawIden $ cname $ _msgName msg
 
-initMsg :: Message a -> C C.Stm
-initMsg msg = do
+initMsgGzip :: Message a -> C C.Stm
+initMsgGzip msg = do
+  str <- require cpp_string
   mapM include
     ["cstdio", "cstdlib", "unistd.h", "sys/types.h", "sys/wait.h", "fcntl.h"]
   depends [cty|struct spawn { int writefd; int pid; }|]
@@ -175,11 +249,11 @@ initMsg msg = do
       }
     }
   }|]
-  str <- require cppstr
+  str <- require cpp_string
   let mkStr = [cexp|$id:("std::string")|]
   return [cstm|{
     $ty:str filename = $mkStr("out/")
-        + $mkStr(argv[1]) + $mkStr($(outputName++""));
+        + $mkStr(argv[1]) + $mkStr($(outputName :: String));
     $id:(fdName msg) =
       spawn_child(filename.c_str(), $codecStr, $(codecStr ++ auxName));
     }|]
@@ -189,9 +263,9 @@ initMsg msg = do
     suffix     = "gz"
     codecStr   = "gzip"
 
-cleanupMsg :: Message a -> C C.Stm
-cleanupMsg msg = do
-  initMsg msg -- pull dependencies
+cleanupMsgGzip :: Message a -> C C.Stm
+cleanupMsgGzip msg = do
+  initMsgGzip msg -- pull dependencies
   return [cstm|{close  ($id:(fdName msg).writefd);
               /* don't wait for them or else strange hang occurs.
                * without waiting, there is a small race condition between
@@ -219,6 +293,5 @@ main = do
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
 
-    want ["bin/a.out"]
-
+    want ["Run a.out"]
 
