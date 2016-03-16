@@ -12,29 +12,33 @@ import           Protocol
 
 import           Development.Shake
 
-import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
-import Text.InterpolatedString.Perl6 (qc)
+import           Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
+import           Text.InterpolatedString.Perl6 (qc)
 
 import           Data.Bits
 import           Utils
 import           Control.Monad
 
 data Specification a = Specification
+  -- TODO break off the first two into their own data type
   { _mkTy       :: Field a -> C C.GType
   , _readMember :: Int -> Field a -> C C.Stm
-  , _handleMsg  :: Message a -> C C.Stm
+  , _handleMsg  :: Message a -> C [C.Stm]
   , _initMsg    :: Message a -> C C.Stm
   , _cleanupMsg :: Message a -> C C.Stm
   }
 
+cstruct :: String -> [C.FieldGroup] -> C C.Type
+cstruct name membs = do
+  depends [cty|struct $id:name {
+    $sdecls:membs
+  }|]
+  return [cty|typename $id:("struct "++name)|]
+
 genStruct :: (Field a -> C C.GType) -> Message a -> C C.Type
 genStruct mkTy msg = do
   decls <- runDecls
-  depends [cty|
-      struct $id:(_msgName msg) {
-        $sdecls:decls
-      }
-    |]
+  cstruct (_msgName msg) decls
   where
     runDecls = mapM declare (_fields msg)
     declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) <$> mkTy f
@@ -68,7 +72,7 @@ mainLoop spec@(Specification {..}) proto = do
     readMsg   <- readStruct spec msg
     struct    <- require $ genStruct _mkTy msg
     handleMsg <- _handleMsg msg
-    let prefix = [cexp|msg.$id:(getId struct)|]
+    let prefix = [cexp|msg.$id:(_msgName msg)|]
  
     return [cstm|case $exp:(_tag msg) : {
  
@@ -77,16 +81,16 @@ mainLoop spec@(Specification {..}) proto = do
         return -1;
       }
       /* parse struct */
-      $id:(getId readMsg) (&msg.$id:(getId struct), buf);
+      $id:(getId readMsg) (&msg.$id:(_msgName msg), buf);
  
-      $stm:(handleMsg)
+      $stms:(handleMsg)
  
       break;
  
     }|]
   structs <- forM (_outgoingMessages proto) $ \msg -> do
     struct <- require $ genStruct _mkTy msg
-    return [csdecl|struct $id:(getId struct) $id:(getId struct);|]
+    return [csdecl|struct $id:(_msgName msg) $id:(_msgName msg);|]
  
   depends [cfun|
     int handle(char *buf) {
@@ -139,23 +143,29 @@ cmain spec@(Specification {..}) proto = do
       rotateL (1::Int) . (+1) . logBase2 . bodyLen proto
  
     logBase2 x = finiteBitSize x - 1 - countLeadingZeros x
+
+compile :: Bool -> C a -> String
+compile dbg code = s 80 $ ppr $ mkCompUnit code
+  where
+    s = switch prettyPragma pretty dbg
  
-compile :: String -> C a -> Rules ()
-compile buildDir code = do
+compileShake :: Bool -> String -> C a -> Rules ()
+compileShake dbg buildDir code = do
  
   let src = [qc|{buildDir}/main.cpp|]
   let out = [qc|{buildDir}/a.out|]
  
   src %> \out -> do
     alwaysRerun
-    writeFileChanged out (prettyPragma 80 (ppr (mkCompUnit code)))
+    writeFileChanged out $ compile dbg code
  
   out %> \out -> do
  
     need [src]
  
+    let dbgFlag = switch "-g" "" dbg
     command_ [Cwd buildDir, Shell] -- Compile
-      [qc|g++ -std=c++11 -march=native -O2 -g main.cpp|] []
+      [qc|g++ -std=c++11 -march=native -O2 {dbgFlag} main.cpp|] []
  
     command_ [Cwd buildDir, Shell] -- Grab the demangled assembly
       [qc|objdump -Cd a.out > main.s|] []

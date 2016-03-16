@@ -1,5 +1,6 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecordWildCards #-}
 module Main where
 
 import Protocol.Tmx.TAQ as TAQ
@@ -8,14 +9,15 @@ import Protocol.Backend.C.Base as C
 
 import           Language.C.Quote.C
 import qualified Language.C.Syntax as C
+import qualified Language.C.Smart as C ((+=))
 import qualified Language.C.Utils as C
-import           Language.C.Smart ((+=))
 import           Language.C.Utils (C, CompUnit, depends, include, noloc)
 import           Language.C.Utils (topDecl, require)
 import           Language.C.Utils (char, bool, ushort, uint, ulong)
 
-import Data.List (intercalate, sort)
-import Data.Maybe (listToMaybe)
+import Data.List (intercalate, sort, nub)
+import Data.Monoid
+import Data.Maybe (listToMaybe, fromMaybe)
 import Data.Char (isSpace)
 
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma, Pretty(..))
@@ -30,13 +32,188 @@ import Development.Shake.FilePath
 
 import System.IO.Unsafe (unsafePerformIO)
 
+import qualified Data.Map as Map
+import           Data.Map (Map(..))
+import qualified Data.Set as Set
+import           Data.Set (Set(..))
+
+import Data.Function
+
+data Void
+
+data Merge a
+  = Tip (Message a)
+  | Node String (Map String (Merge a))
+
+data Projection a
+  = Projection { projNames :: [String], projsrc :: (Merge a) }
+
+data Op = Add | Mul
+
+data Fold a
+  = Foldl { foldop :: Op, foldsrc :: a } -- TODO initializer?
+
+data Zip a b = ZipWith { zipop :: Op, zipsrca :: a, zipsrcb :: b }
+
+data AST a
+  = ZipExp (Zip (AST a) (AST a))
+  | FoldExp (Fold (AST a))
+  | ProjectExp (Projection a)
+
+set :: Ord a => [a] -> Set a
+set = Set.fromList
+
+compileOp :: Op -> (C.Exp -> C.Exp -> C.Exp)
+compileOp Add = (+)
+compileOp Mul = (*)
+
+compileAST :: C.Specification TAQ -> AST TAQ -> C (ASTState TAQ)
+compileAST spec ast = case ast of
+  FoldExp (Foldl op ast) -> do
+    st <- compileAST spec ast
+    compileFold (Foldl op st)
+  ZipExp (ZipWith op ast1 ast2) -> do
+    st1 <- compileAST spec ast1
+    st2 <- compileAST spec ast2
+    compileZip (ZipWith op st1 st2)
+  ProjectExp p -> compileProjection spec p
+
+data ASTState a = ASTState
+  { src  :: String
+  , deps :: Set (Message a)
+  , spec :: C.Specification a
+  }
+
+compileFold :: Fold (ASTState TAQ) -> C (ASTState TAQ)
+compileFold (Foldl op (ASTState {..})) = do
+  id <- mkId
+  return $ ASTState id deps $ Specification
+    { _mkTy       = _mkTy spec
+    , _readMember = _readMember spec
+    , _handleMsg  = handleMsg spec id src deps
+    , _initMsg    = _initMsg spec
+    , _cleanupMsg = _cleanupMsg spec
+    }
+  where
+    -- (field, pmsg) = resolveProjection p
+    mkId          = C.genId [qc|fold|]
+    init          = 0::Int
+    handleMsg spec id proj deps msg = do
+      topDecl [cdecl|$ty:auto $id:id = $init;|]
+      handler <- _handleMsg spec msg
+      return $ if msg `elem` deps
+        then handler `snoc` [cstm|$id:id = $exp;|]
+        else handler
+      where
+        exp = compileOp op [cexp|$id:id|] [cexp|$id:src|]
+
+{- unclear if this will be useful.
+instance ToExp C.Id where
+  toExp id loc = C.Var id loc
+-}
+
+compileZip :: Zip (ASTState TAQ) (ASTState TAQ) -> C (ASTState TAQ)
+compileZip (ZipWith op ast1 ast2) = do
+  id <- mkId
+  let ASTState src1 deps1 spec1 = ast1
+  let ASTState src2 deps2 spec2 = ast2
+  return $ ASTState id (deps1 <> deps2) $ Specification
+    { _mkTy       = _mkTy spec1
+    , _readMember = _readMember spec1
+    , _handleMsg  = handleMsg id spec1 spec2 deps1 deps2 src1 src2
+    , _initMsg    = _initMsg spec1    -- TODO get both
+    , _cleanupMsg = _cleanupMsg spec1 -- TODO get both
+    }
+  where
+    -- (field1, msg1)   = resolveProjection p1
+    -- (field2, msg2)   = resolveProjection p2
+    fnm              = cnm . _name
+    mkId             = C.genId [qc|zip|] -- _{fnm field1}__{fnm field2}|]
+    handleMsg id spec1 spec2 deps1 deps2 proj1 proj2 msg = do
+      topDecl [cdecl|$ty:auto $id:id = 0;|]
+      handler1 <- (_handleMsg spec1) msg
+      handler2 <- (_handleMsg spec2) msg
+      let handler = nub $ handler1 ++ handler2 -- will this work?
+      return $ if msg `Set.member` (deps1 <> deps2)
+        then handler `snoc` [cstm|$id:id = $exp;|]
+        else handler
+      where
+        exp = compileOp op [cexp|$id:proj1|] [cexp|$id:proj2|]
+
+cnm :: String -> String
+cnm = rawIden . cname
+
+compileProjection :: C.Specification TAQ -> Projection TAQ
+  -> C (ASTState TAQ)
+compileProjection (Specification {..}) projection@(Projection ps _) = do
+  id <- C.genId [qc|projection_{pname}|]
+  return $ ASTState id (Set.singleton pmsg) $ Specification
+    { _mkTy       = _mkTy
+    , _readMember = _readMember
+    , _initMsg    = _initMsg
+    , _handleMsg  = handleMsg id
+    , _cleanupMsg = _cleanupMsg
+    }
+  where
+    pname = intercalate "_" $ cnm <$> ps
+    handleMsg id msg = do
+      topDecl =<< declare id <$> mkTy field
+      handler <- _handleMsg msg
+      return $ if pmsg == msg
+        then handler `snoc`
+          [cstm|$id:id = msg.$id:(_msgName msg).$id:fieldName;|]
+        else handler
+    (field, pmsg)  = resolveProjection projection
+    fieldName      = cnm $ _name field
+
+declare id gty = case gty of
+  C.SimpleTy t   -> [cdecl|$ty:t $id:id;|]
+  C.ArrayTy t sz -> [cdecl|$ty:t $id:id[$sz];|]
+
+fieldsMap :: Message a -> Map String (Field a)
+fieldsMap msg = Map.fromList $ (\field -> (_name field, field)) <$> _fields msg
+
+resolveProjection :: Projection a -> (Field a, Message a)
+resolveProjection (Projection [last] (Tip msg)) = (field, msg)
+  where
+    field = Map.lookup last (fieldsMap msg)
+      & fromMaybe
+        (error [qc|Field "{last}" not found in message {_msgName msg}|])
+
+resolveProjection (Projection (name:xs) (Node _ m)) = resolveProjection next
+  where
+    next = Projection xs $ Map.lookup name m
+      & fromMaybe (error [qc|"{name}" not found in {Map.keys m}|])
+
+resolveProjection (Projection [] n) = error "Projection too many levels deep."
+resolveProjection (Projection xs (Tip {})) = error "Projection too shallow."
+resolveProjection _ = error "Internal invariant violated: impossible case."
+
+singleton :: Message a -> Merge a
+singleton = Tip
+name_ :: Merge a -> String
+name_ (Tip msg) = _msgName msg
+name_ (Node nm _) = nm
+merge :: String -> [Merge a] -> Merge a
+merge name = Node name . Map.fromList . map (\m -> (name_ m, m))
+
+mergeStruct :: Merge TAQ -> C C.Type
+mergeStruct (Tip msg) = genStruct mkTy msg
+mergeStruct n@(Node name merges) = do
+  membs <- mkMember `mapM` (Map.elems merges)
+  cstruct name membs
+  where
+    mkMember n = do
+      struct <- mergeStruct n
+      return [csdecl|$ty:struct $id:(name_ n);|]
+
 taqCSpec :: C.Specification TAQ
 taqCSpec = C.Specification
   { _mkTy       = mkTy
   , _readMember = readMember
-  , _handleMsg  = handleMsgGroupBy
-  , _initMsg    = initMsgGroupBy
-  , _cleanupMsg = cleanupMsgGroupBy
+  , _handleMsg  = handleMsgPlain
+  , _initMsg    = initMsgPlain
+  , _cleanupMsg = cleanupMsgPlain
   }
 
 -- shamelessly taken from neat-interpolation
@@ -51,10 +228,19 @@ dedent s = case minimumIndent s of
 noop :: C.Stm
 noop = [cstm|/*no-op*/(void)0;|]
 
+initMsgPlain :: Message TAQ -> C C.Stm
+initMsgPlain msg = pure noop
+
+handleMsgPlain :: Message TAQ -> C [C.Stm]
+handleMsgPlain msg = pure [noop]
+
+cleanupMsgPlain :: Message TAQ -> C C.Stm
+cleanupMsgPlain msg = pure noop
+
 initMsgGroupBy :: Message TAQ -> C C.Stm
 initMsgGroupBy msg = pure noop
 
-handleMsgGroupBy = handleMsgGroupBy__ (+=) (getField id "Symbol" taq "trade")
+handleMsgGroupBy = handleMsgGroupBy__ (C.+=) (getField id "Symbol" taq "trade")
 
 handleMsgGroupBy__ :: (C.Exp -> C.Exp -> C.Stm) -> Field TAQ -> Message TAQ -> C C.Stm
 handleMsgGroupBy__ mkStmt field msg = case _msgName msg of
@@ -66,8 +252,10 @@ handleMsgGroupBy__ mkStmt field msg = case _msgName msg of
     return $ mkStmt [cexp|groupby[msg.trade.symbol]|] [cexp|msg.trade.price|]
   _ -> pure noop
 
-trace :: Show a => a -> a
-trace a = unsafePerformIO $ print a >> return a
+traceWith :: (a -> String) -> a -> a
+traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
+trace :: Show a => String -> a -> a
+trace s = traceWith $ ((s++": ")++) . show
 
 showc :: Pretty c => c -> String
 showc = pretty 0 . ppr
@@ -79,15 +267,16 @@ cleanupMsgGroupBy msg = case _msgName msg of
       printf("%.8s %d\n", &it->first, it->second);
     }|]
   _ -> pure noop
-  where
-    auto = [cty|typename $id:("auto")|]
+
+auto :: C.Type
+auto = [cty|typename $id:("auto")|]
 
 handleMsgGzip :: Message TAQ -> C C.Stm
 handleMsgGzip msg = do
   struct <- require $ genStruct mkTy msg
   return [cstm|write($id:(fdName msg).writefd,
-          &msg.$id:(C.getId struct),
-          sizeof(struct $id:(C.getId struct)));|]
+          &msg.$id:(_msgName msg),
+          sizeof(struct $id:(_msgName msg)));|]
   where
     cnm = rawIden . cname . _msgName
 
@@ -102,14 +291,13 @@ cpp_unordered_map k v = do
   return [cty|typename $id:ty|]
   where
     ty :: String = [qc|std::unordered_map<{showc k}, {showc v}>|]
-    -- sk           = tostr k
-    -- sv           = tostr v
 
 assert :: Bool -> a -> a
 assert pred a = if pred then a else (error "Assertion failed")
 
 symbol :: C C.Type
 symbol = do
+  include "functional"
   hash <- depends [cedecl|$esc:esc|]
   depends [cty|struct symbol { $ty:ulong symbol; }|]
   return [cty|typename $id:("struct symbol")|]
@@ -274,11 +462,21 @@ cleanupMsgGzip msg = do
                * waitpid($id:(fdName msg).pid, NULL, 0); */
                 ;}|]
 
+program = do
+  intermediate1 <- compileAST taqCSpec $
+    FoldExp $ Foldl Add $
+      ZipExp $ ZipWith Mul
+        (ProjectExp $ Projection ["Price"] (Tip tradeFields))
+        (ProjectExp $ Projection ["Shares"] (Tip tradeFields))
+  intermediate2 <- compileAST taqCSpec $ FoldExp $ Foldl Add
+    $ ProjectExp $ Projection ["Price"] (Tip tradeFields)
+  cmain (spec intermediate1) taq
+
 main = do
 
   shakeArgs shakeOptions $ do
 
-    compile "bin" (cmain taqCSpec taq)
+    compileShake False "bin" program
 
     let exe = "bin/a.out"
 
@@ -293,5 +491,5 @@ main = do
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
 
-    want ["Run a.out"]
+    want ["bin/a.out"]
 

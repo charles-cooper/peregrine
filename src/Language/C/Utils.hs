@@ -12,6 +12,7 @@ module Language.C.Utils (
   noloc,
   getCompUnit,
   mkCompUnit,
+  genId,
   Identifiable(..),
 
   char,
@@ -28,9 +29,12 @@ import Text.InterpolatedString.Perl6 (qc)
 
 import Data.Loc (SrcLoc(..), Loc(..))
 
-import Control.Monad.State
-import Data.Monoid
-import Data.List (nub)
+import           Control.Monad.State
+import           Data.Monoid
+import           Data.Maybe
+import           Data.List (nub)
+import qualified Data.Map as Map
+import           Data.Map (Map(..))
 
 char   = [cty|char|]
 uchar  = [cty|typename uint8_t|]
@@ -38,6 +42,11 @@ bool   = [cty|typename bool|]
 ushort = [cty|typename uint16_t|]
 uint   = [cty|typename uint32_t|]
 ulong  = [cty|typename uint64_t|]
+
+data CState = CState
+  { _compunit :: CompUnit
+  , _ids      :: Map String Int
+  }
 
 data CompUnit = CompUnit
   { includes  :: [Includes]
@@ -52,10 +61,27 @@ instance Monoid CompUnit where
   mappend (CompUnit a b c d e) (CompUnit a' b' c' d' e') =
     CompUnit (a<>a') (b<>b') (c<>c') (d<>d') (e<>e')
 
-type C a = State CompUnit a
+instance Monoid CState where
+  mempty = CState mempty mempty
+  mappend (CState a b) (CState a' b') = CState (a<>a') (b<>b')
+
+genId :: String -> C String
+genId str = do
+  st <- get
+  let (id, newids) = count str $ _ids $ st
+  put $ st { _ids = newids }
+  return $ str ++ "_" ++ show id
+  where
+    count a old = let
+      f _k new old = new + old
+      (mret, new) = Map.insertLookupWithKey f a 1 old
+      in (fromMaybe 0 mret, new)
+
+
+type C a = State CState a
 depends :: TopLevel a => a -> C a
 depends d = do
-  modify (<>define d)
+  modify (\cstate -> cstate { _compunit = _compunit cstate <>define d } )
   return d
 
 -- another way of saying 'id'
@@ -70,7 +96,7 @@ include :: String -> C Includes
 include = depends . Includes
 
 getCompUnit :: C a -> CompUnit
-getCompUnit c = execState c mempty
+getCompUnit c = _compunit $ execState c mempty
 
 newtype Includes = Includes String deriving (Eq, Ord, Show)
 class TopLevel a where
@@ -126,12 +152,4 @@ class Identifiable a where
 instance Identifiable C.Func where
   getId (C.Func _ iden _ _ _ _)      = iden
   getId (C.OldFunc _ iden _ _ _ _ _) = iden
--- thi sisn't exactly right ..
-instance Identifiable C.Type where
-  getId t@(C.Type (C.DeclSpec _ _ ty _) _ _) = case ty of
-    C.Tstruct (Just id) _ _ _ -> id
-    C.Tunion  (Just id) _ _ _ -> id
-    C.Tenum   (Just id) _ _ _ -> id
-    _ -> error $ "Not identifiable: " ++ show t
-  getId t = error $ "Not identifiable: " ++ show t
 
