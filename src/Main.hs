@@ -462,7 +462,7 @@ program = do
     FoldExp $ Foldl Add $
       ZipExp $ ZipWith Mul
         (ProjectExp $ Projection ["Price"] (Tip tradeFields))
-        (ProjectExp $ Projection ["Shares"] (Tip tradeFields))
+        (ProjectExp $ Projection ["Bid Size"] (Tip quoteFields))
   intermediate2 <- compileAST taqCSpec handlerPlain $ FoldExp $ Foldl Add
     $ ProjectExp $ Projection ["Price"] (Tip tradeFields)
   cmain taqCSpec (handlers intermediate1) taq
