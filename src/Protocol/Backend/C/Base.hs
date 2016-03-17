@@ -79,7 +79,6 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
  
     return [cstm|case $exp:(_tag msg) : {
  
-      /* read bytes */
       if (fread(buf, 1, $(bodyLen proto msg), stdin) == 0) {
         return -1;
       }

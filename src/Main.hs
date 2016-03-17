@@ -11,7 +11,7 @@ import           Language.C.Quote.C
 import qualified Language.C.Syntax as C
 import qualified Language.C.Smart as C ((+=))
 import qualified Language.C.Utils as C
-import           Language.C.Utils (C, CompUnit, depends, include, noloc)
+import           Language.C.Utils (C, depends, include, noloc)
 import           Language.C.Utils (topDecl, require)
 import           Language.C.Utils (char, bool, ushort, uint, ulong)
 
@@ -224,13 +224,13 @@ noop :: C.Stm
 noop = [cstm|/*no-op*/(void)0;|]
 
 initMsgPlain :: Message a -> C [C.Stm]
-initMsgPlain = const (pure [noop])
+initMsgPlain = const (pure [])
 
 handleMsgPlain :: Message a -> C [C.Stm]
-handleMsgPlain = const (pure [noop])
+handleMsgPlain = const (pure [])
 
 cleanupMsgPlain :: Message a -> C [C.Stm]
-cleanupMsgPlain = const (pure [noop])
+cleanupMsgPlain = const (pure [])
 
 initMsgGroupBy :: Message TAQ -> C C.Stm
 initMsgGroupBy msg = pure noop

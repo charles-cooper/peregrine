@@ -4,13 +4,11 @@ module Language.C.Utils (
   C,
   GType(..),
   Includes(..),
-  CompUnit(..),
   depends,
   include,
   require,
   topDecl,
   noloc,
-  getCompUnit,
   mkCompUnit,
   genId,
   Identifiable(..),
@@ -33,6 +31,7 @@ import           Control.Monad.State
 import           Data.Monoid
 import           Data.Maybe
 import           Data.List (nub)
+import           Data.Tuple (swap)
 import qualified Data.Map as Map
 import           Data.Map (Map(..))
 
@@ -48,16 +47,32 @@ data CState = CState
   , _ids      :: Map String Int
   }
 
+-- set which preserves insertion order of its elements
+newtype InsertionSet a = InsertionSet { _imap :: Map a Int }
+
+instance Ord a => Monoid (InsertionSet a) where
+  mempty = InsertionSet mempty
+  mappend m m' = foldr push m (insertionOrder m')
+
+push :: Ord a => a -> InsertionSet a -> InsertionSet a
+push a (InsertionSet m) = InsertionSet $ case Map.lookup a m of
+  Nothing -> Map.insert a (Map.size m) m
+  Just _  -> m
+
+insertionOrder :: InsertionSet a -> [a]
+insertionOrder = Map.elems . Map.fromList . map swap . Map.toList . _imap
+
 data CompUnit = CompUnit
-  { includes  :: [Includes]
-  , decls     :: [C.Definition] -- useful for inserting raw C++ declarations
-  , typedecls :: [C.Type]
-  , functions :: [C.Func]
-  , topLevel  :: [C.InitGroup]
+  { includes  :: InsertionSet Includes
+  , decls     :: InsertionSet C.Definition
+  -- ^ Useful for inserting raw C++ declarations
+  , typedecls :: InsertionSet C.Type
+  , functions :: InsertionSet C.Func
+  , topLevel  :: InsertionSet C.InitGroup
   }
 
 instance Monoid CompUnit where
-  mempty = CompUnit [] [] [] [] []
+  mempty = CompUnit mempty mempty mempty mempty mempty
   mappend (CompUnit a b c d e) (CompUnit a' b' c' d' e') =
     CompUnit (a<>a') (b<>b') (c<>c') (d<>d') (e<>e')
 
@@ -102,15 +117,21 @@ newtype Includes = Includes String deriving (Eq, Ord, Show)
 class TopLevel a where
   define :: a -> CompUnit
 instance TopLevel Includes where
-  define inc  = CompUnit [inc] [] [] [] []
+  define inc  = CompUnit (single inc) e e e e
 instance TopLevel C.Definition where
-  define def  = CompUnit [] [def] [] [] []
+  define def  = CompUnit e (single def) e e e
 instance TopLevel C.Type where
-  define ty   = CompUnit [] [] [ty] [] []
+  define ty   = CompUnit e e (single ty) e e
 instance TopLevel C.Func where
-  define func = CompUnit [] [] [] [func] []
+  define func = CompUnit e e e (single func) e
 instance TopLevel C.InitGroup where
-  define init = CompUnit [] [] [] [] [init]
+  define init = CompUnit e e e e (single init)
+
+e :: Monoid m => m
+e = mempty
+
+single :: Ord a => a -> InsertionSet a
+single a = push a mempty
 
 noloc :: SrcLoc
 noloc = SrcLoc NoLoc
@@ -124,19 +145,19 @@ data GType = ArrayTy  { arrayty :: C.Type, arraysize :: Int }
 mkCompUnit :: C a -> [C.Definition]
 mkCompUnit code = [cunit|
     /* Includes */
-    $edecls:(nub $ include <$> incls)
+    $edecls:(include <$> insertionOrder incls)
  
     /* Types */
-    $edecls:(typedecl <$> nub tys)
+    $edecls:(typedecl <$> insertionOrder tys)
  
     /* Other definitions */
-    $edecls:(nub $ defs)
+    $edecls:(insertionOrder defs)
  
     /* Top level declarations */
-    $edecls:(declare <$> nub decls)
+    $edecls:(declare <$> insertionOrder decls)
  
     /* Functions */
-    $edecls:(fundecl <$> nub funcs)
+    $edecls:(fundecl <$> insertionOrder funcs)
   |]
   where
     includeStr header          = [qc|#include <{header::String}>|]
