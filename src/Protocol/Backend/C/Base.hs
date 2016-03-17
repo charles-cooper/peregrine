@@ -20,12 +20,14 @@ import           Utils
 import           Control.Monad
 
 data Specification a = Specification
-  -- TODO break off the first two into their own data type
   { _mkTy       :: Field a -> C C.GType
   , _readMember :: Int -> Field a -> C C.Stm
-  , _handleMsg  :: Message a -> C [C.Stm]
-  , _initMsg    :: Message a -> C C.Stm
-  , _cleanupMsg :: Message a -> C C.Stm
+  }
+
+data MsgHandler a = MsgHandler
+  { _handleMsg  :: Message a -> C [C.Stm]
+  , _initMsg    :: Message a -> C [C.Stm]
+  , _cleanupMsg :: Message a -> C [C.Stm]
   }
 
 cstruct :: String -> [C.FieldGroup] -> C C.Type
@@ -35,13 +37,14 @@ cstruct name membs = do
   }|]
   return [cty|typename $id:("struct "++name)|]
 
-genStruct :: (Field a -> C C.GType) -> Message a -> C C.Type
-genStruct mkTy msg = do
+genStruct :: Specification a -> Message a -> C C.Type
+genStruct spec msg = do
   decls <- runDecls
   cstruct (_msgName msg) decls
   where
     runDecls = mapM declare (_fields msg)
     declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) <$> mkTy f
+    mkTy = _mkTy spec
 
 mkCsdecl :: String -> C.GType -> C.FieldGroup                                   
 mkCsdecl nm (C.SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
@@ -50,7 +53,7 @@ mkCsdecl nm (C.ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$sz]; |]
 readStruct :: Specification a -> Message a -> C C.Func
 readStruct spec@(Specification {..}) msg = do
   include "cstring"
-  require (genStruct _mkTy msg)
+  require (genStruct spec msg)
   require impl
   where
     impl = do
@@ -65,12 +68,12 @@ readStruct spec@(Specification {..}) msg = do
     ofsts             = scanl (+) 0 (_len <$> _fields msg)
     stms              = zipWithM _readMember ofsts (_fields msg)
  
-mainLoop :: Specification a -> Proto a -> C C.Func
-mainLoop spec@(Specification {..}) proto = do
+mainLoop :: Specification a -> MsgHandler a -> Proto a -> C C.Func
+mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
   include "stdio.h"
   cases <- forM (_outgoingMessages proto) $ \msg -> do
     readMsg   <- readStruct spec msg
-    struct    <- require $ genStruct _mkTy msg
+    struct    <- require $ genStruct spec msg
     handleMsg <- _handleMsg msg
     let prefix = [cexp|msg.$id:(_msgName msg)|]
  
@@ -89,7 +92,7 @@ mainLoop spec@(Specification {..}) proto = do
  
     }|]
   structs <- forM (_outgoingMessages proto) $ \msg -> do
-    struct <- require $ genStruct _mkTy msg
+    struct <- require $ genStruct spec msg
     return [csdecl|struct $id:(_msgName msg) $id:(_msgName msg);|]
  
   depends [cfun|
@@ -111,16 +114,15 @@ mainLoop spec@(Specification {..}) proto = do
     }
   |]
  
-cmain :: Specification a -> Proto a -> C C.Func
-cmain spec@(Specification {..}) proto = do
+cmain :: Specification a -> MsgHandler a -> Proto a -> C C.Func
+cmain spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
   include "cstdio"
-  loopStep     <- mainLoop spec proto
-  -- outputPrefix <- topDecl [cdecl|char const *outputPrefix;|]
+  loopStep     <- mainLoop spec handler proto
   initMsgs     <- _initMsg `mapM` _outgoingMessages proto
   cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages proto
  
   depends [cfun|int main(int argc, char **argv) {
-    $stms:(initMsgs)
+    $stms:(concat initMsgs)
     char buf[$bufLen];
     int ret = 0;
     int pkts = 0;
@@ -134,7 +136,7 @@ cmain spec@(Specification {..}) proto = do
     }
  
     fprintf(stderr, "Cleaning up.\n");
-    $stms:(cleanupMsgs)
+    $stms:(concat cleanupMsgs)
     fprintf(stderr, "%d packets\n", pkts);
  
   }|]

@@ -67,35 +67,35 @@ compileOp :: Op -> (C.Exp -> C.Exp -> C.Exp)
 compileOp Add = (+)
 compileOp Mul = (*)
 
-compileAST :: C.Specification TAQ -> AST TAQ -> C (ASTState TAQ)
-compileAST spec ast = case ast of
+compileAST :: C.Specification TAQ
+  -> C.MsgHandler TAQ
+  -> AST TAQ
+  -> C (ASTState TAQ)
+compileAST spec handler ast = case ast of
   FoldExp (Foldl op ast) -> do
-    st <- compileAST spec ast
+    st <- compileAST spec handler ast
     compileFold (Foldl op st)
   ZipExp (ZipWith op ast1 ast2) -> do
-    st1 <- compileAST spec ast1
-    st2 <- compileAST spec ast2
+    st1 <- compileAST spec handler ast1
+    st2 <- compileAST spec handler ast2
     compileZip (ZipWith op st1 st2)
-  ProjectExp p -> compileProjection spec p
+  ProjectExp p -> compileProjection spec handler p
 
 data ASTState a = ASTState
-  { src  :: String
-  , deps :: Set (Message a)
-  , spec :: C.Specification a
+  { src      :: String
+  , deps     :: Set (Message a)
+  , handlers :: C.MsgHandler a
   }
 
 compileFold :: Fold (ASTState TAQ) -> C (ASTState TAQ)
 compileFold (Foldl op (ASTState {..})) = do
   id <- mkId
-  return $ ASTState id deps $ Specification
-    { _mkTy       = _mkTy spec
-    , _readMember = _readMember spec
-    , _handleMsg  = handleMsg spec id src deps
-    , _initMsg    = _initMsg spec
-    , _cleanupMsg = _cleanupMsg spec
+  return $ ASTState id deps $ C.MsgHandler
+    { _handleMsg  = handleMsg handlers id src deps
+    , _initMsg    = _initMsg handlers
+    , _cleanupMsg = _cleanupMsg handlers
     }
   where
-    -- (field, pmsg) = resolveProjection p
     mkId          = C.genId [qc|fold|]
     init          = 0::Int
     handleMsg spec id proj deps msg = do
@@ -107,28 +107,19 @@ compileFold (Foldl op (ASTState {..})) = do
       where
         exp = compileOp op [cexp|$id:id|] [cexp|$id:src|]
 
-{- unclear if this will be useful.
-instance ToExp C.Id where
-  toExp id loc = C.Var id loc
--}
-
 compileZip :: Zip (ASTState TAQ) (ASTState TAQ) -> C (ASTState TAQ)
 compileZip (ZipWith op ast1 ast2) = do
   id <- mkId
   let ASTState src1 deps1 spec1 = ast1
   let ASTState src2 deps2 spec2 = ast2
-  return $ ASTState id (deps1 <> deps2) $ Specification
-    { _mkTy       = _mkTy spec1
-    , _readMember = _readMember spec1
-    , _handleMsg  = handleMsg id spec1 spec2 deps1 deps2 src1 src2
-    , _initMsg    = _initMsg spec1    -- TODO get both
-    , _cleanupMsg = _cleanupMsg spec1 -- TODO get both
+  return $ ASTState id (deps1 <> deps2) $ C.MsgHandler
+    { _handleMsg  = handleMsg id spec1 spec2 deps1 deps2 src1 src2
+    , _initMsg    = _initMsg spec1    -- TODO get both?
+    , _cleanupMsg = _cleanupMsg spec1 -- TODO get both?
     }
   where
-    -- (field1, msg1)   = resolveProjection p1
-    -- (field2, msg2)   = resolveProjection p2
     fnm              = cnm . _name
-    mkId             = C.genId [qc|zip|] -- _{fnm field1}__{fnm field2}|]
+    mkId             = C.genId [qc|zip|]
     handleMsg id spec1 spec2 deps1 deps2 proj1 proj2 msg = do
       topDecl [cdecl|$ty:auto $id:id = 0;|]
       handler1 <- (_handleMsg spec1) msg
@@ -143,14 +134,14 @@ compileZip (ZipWith op ast1 ast2) = do
 cnm :: String -> String
 cnm = rawIden . cname
 
-compileProjection :: C.Specification TAQ -> Projection TAQ
+compileProjection :: C.Specification TAQ
+  -> C.MsgHandler TAQ
+  -> Projection TAQ
   -> C (ASTState TAQ)
-compileProjection (Specification {..}) projection@(Projection ps _) = do
+compileProjection (Specification {..}) (MsgHandler {..}) p@(Projection ps _) = do
   id <- C.genId [qc|projection_{pname}|]
-  return $ ASTState id (Set.singleton pmsg) $ Specification
-    { _mkTy       = _mkTy
-    , _readMember = _readMember
-    , _initMsg    = _initMsg
+  return $ ASTState id (Set.singleton pmsg) $ C.MsgHandler
+    { _initMsg    = _initMsg
     , _handleMsg  = handleMsg id
     , _cleanupMsg = _cleanupMsg
     }
@@ -163,7 +154,7 @@ compileProjection (Specification {..}) projection@(Projection ps _) = do
         then handler `snoc`
           [cstm|$id:id = msg.$id:(_msgName msg).$id:fieldName;|]
         else handler
-    (field, pmsg)  = resolveProjection projection
+    (field, pmsg)  = resolveProjection p
     fieldName      = cnm $ _name field
 
 declare id gty = case gty of
@@ -198,7 +189,7 @@ merge :: String -> [Merge a] -> Merge a
 merge name = Node name . Map.fromList . map (\m -> (name_ m, m))
 
 mergeStruct :: Merge TAQ -> C C.Type
-mergeStruct (Tip msg) = genStruct mkTy msg
+mergeStruct (Tip msg) = genStruct taqCSpec msg
 mergeStruct n@(Node name merges) = do
   membs <- mkMember `mapM` (Map.elems merges)
   cstruct name membs
@@ -211,7 +202,11 @@ taqCSpec :: C.Specification TAQ
 taqCSpec = C.Specification
   { _mkTy       = mkTy
   , _readMember = readMember
-  , _handleMsg  = handleMsgPlain
+  }
+
+handlerPlain :: C.MsgHandler a
+handlerPlain = C.MsgHandler
+  { _handleMsg  = handleMsgPlain
   , _initMsg    = initMsgPlain
   , _cleanupMsg = cleanupMsgPlain
   }
@@ -228,14 +223,14 @@ dedent s = case minimumIndent s of
 noop :: C.Stm
 noop = [cstm|/*no-op*/(void)0;|]
 
-initMsgPlain :: Message TAQ -> C C.Stm
-initMsgPlain msg = pure noop
+initMsgPlain :: Message a -> C [C.Stm]
+initMsgPlain = const (pure [noop])
 
-handleMsgPlain :: Message TAQ -> C [C.Stm]
-handleMsgPlain msg = pure [noop]
+handleMsgPlain :: Message a -> C [C.Stm]
+handleMsgPlain = const (pure [noop])
 
-cleanupMsgPlain :: Message TAQ -> C C.Stm
-cleanupMsgPlain msg = pure noop
+cleanupMsgPlain :: Message a -> C [C.Stm]
+cleanupMsgPlain = const (pure [noop])
 
 initMsgGroupBy :: Message TAQ -> C C.Stm
 initMsgGroupBy msg = pure noop
@@ -273,7 +268,7 @@ auto = [cty|typename $id:("auto")|]
 
 handleMsgGzip :: Message TAQ -> C C.Stm
 handleMsgGzip msg = do
-  struct <- require $ genStruct mkTy msg
+  struct <- require $ genStruct taqCSpec msg
   return [cstm|write($id:(fdName msg).writefd,
           &msg.$id:(_msgName msg),
           sizeof(struct $id:(_msgName msg)));|]
@@ -463,14 +458,14 @@ cleanupMsgGzip msg = do
                 ;}|]
 
 program = do
-  intermediate1 <- compileAST taqCSpec $
+  intermediate1 <- compileAST taqCSpec handlerPlain $
     FoldExp $ Foldl Add $
       ZipExp $ ZipWith Mul
         (ProjectExp $ Projection ["Price"] (Tip tradeFields))
         (ProjectExp $ Projection ["Shares"] (Tip tradeFields))
-  intermediate2 <- compileAST taqCSpec $ FoldExp $ Foldl Add
+  intermediate2 <- compileAST taqCSpec handlerPlain $ FoldExp $ Foldl Add
     $ ProjectExp $ Projection ["Price"] (Tip tradeFields)
-  cmain (spec intermediate1) taq
+  cmain taqCSpec (handlers intermediate1) taq
 
 main = do
 
