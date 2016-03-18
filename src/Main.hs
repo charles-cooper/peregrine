@@ -1,6 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE CPP #-}
 module Main where
 
 import Protocol.Tmx.TAQ as TAQ
@@ -60,11 +61,13 @@ data Op = Add | Mul
 data Fold a
   = Foldl { foldop :: Op, foldsrc :: a } -- TODO initializer?
 
-data Zip a b = ZipWith { zipop :: Op, zipsrca :: a, zipsrcb :: b }
+data Zip a b
+  = ZipWith { zipop :: Op, zipsrca :: a, zipsrcb :: b }
+  | OneOf { zipsrca :: a, zipsrcb :: b }
 
 data AST a
   = ZipExp (Zip (AST a) (AST a))
-  -- | GroupByExp (AST a) (Fold (AST a))
+  | GroupByExp (AST a) (Fold (AST a))
   | FoldExp (Fold (AST a))
   | ProjectExp (Projection a)
 
@@ -83,10 +86,19 @@ compileAST spec handler ast = case ast of
   FoldExp (Foldl op ast) -> do
     st <- compileAST spec handler ast
     compileFold (Foldl op st)
-  ZipExp (ZipWith op ast1 ast2) -> do
-    st1 <- compileAST spec handler ast1
-    st2 <- compileAST spec handler ast2
-    compileZip (ZipWith op st1 st2)
+  ZipExp z -> case z of
+    (ZipWith op ast1 ast2) -> do
+      st1 <- compileAST spec handler ast1
+      st2 <- compileAST spec handler ast2
+      compileZip (ZipWith op st1 st2)
+    (OneOf ast1 ast2) -> do
+      st1 <- compileAST spec handler ast1
+      st2 <- compileAST spec handler ast2
+      compileZip (OneOf st1 st2)
+  GroupByExp a (Foldl op ast) -> do
+    st1 <- compileAST spec handler a
+    st2 <- compileAST spec handler ast
+    compileGroupBy st1 (Foldl op st2)
   ProjectExp p -> compileProjection spec handler p
 
 data ASTState a = ASTState
@@ -95,23 +107,32 @@ data ASTState a = ASTState
   , handlers :: [C.MsgHandler a]
   }
 
-{-
 compileGroupBy :: Ord a => ASTState a -> Fold (ASTState a) -> C (ASTState a)
-compileGroupBy (ASTState src1 deps1 handlers1) (Foldl op (ASTState src2 deps2 handlers2)) = do
+compileGroupBy (ASTState key deps1 handlers1) (Foldl op (ASTState value deps2 handlers2)) = do
   id <- mkId
-  return $ ASTState id deps $ C.MsgHandler
-    { _handleMsg  = handleMsg id src1 src2 deps1 deps2
+  return $ ASTState id deps $ snoc (handlers1<>handlers2) $ C.MsgHandler
+    { _handleMsg  = handleMsg id deps
     , _initMsg    = mempty_
     , _cleanupMsg = mempty_
     }
   where
+    deps = deps1 <> deps2
     mkId  = C.genId [qc|group_by|]
-    mapTy = cpp_unordered_map (decltype src1) (decltype src2)
-    handleMsg id src1 src2 deps1 deps2 msg = do
+    mapTy = cpp_unordered_map (decltype key) (decltype value)
+    handleMsg id deps msg = do
       mapty <- mapTy
       topDecl [cdecl|$ty:mapty $id:id;|]
-      return undefined
--}
+      if (msg `Set.member` deps)
+        then return [cstms|
+          if (! $id:id.count($id:key)) {
+            $id:id[$id:key] = $init;
+          }
+          $id:id[$id:key] = $exp;
+          |]
+        else return []
+      where
+        exp  = compileOp op [cexp|$id:id[$id:key]|] [cexp|$id:value|]
+        init = 0::Int
 
 decltype :: String -> C.Type
 decltype id = [cty|typename $id:("decltype("<>id<>")")|]
@@ -136,7 +157,7 @@ compileFold (Foldl op (ASTState {..})) = do
         exp = compileOp op [cexp|$id:id|] [cexp|$id:src|]
 
 compileZip :: Ord a => Zip (ASTState a) (ASTState a) -> C (ASTState a)
-compileZip (ZipWith op ast1 ast2) = do
+compileZip z = do
   id <- mkId
   let ASTState src1 deps1 spec1 = ast1
   let ASTState src2 deps2 spec2 = ast2
@@ -146,15 +167,30 @@ compileZip (ZipWith op ast1 ast2) = do
     , _cleanupMsg = mempty_
     }
   where
+    (ast1, ast2)     = (zipsrca z, zipsrcb z)
     fnm              = cnm . _name
     mkId             = C.genId [qc|zip|]
     handleMsg id deps1 deps2 proj1 proj2 msg = do
-      topDecl [cdecl|$ty:auto $id:id = 0;|]
+      topDecl [cdecl|$ty:ty $id:id;|]
       return $ if msg `Set.member` (deps1 <> deps2)
         then [[cstm|$id:id = $exp;|]]
         else []
       where
-        exp = compileOp op [cexp|$id:proj1|] [cexp|$id:proj2|]
+        ty  = case z of
+          (ZipWith op _ _) -> decltype (showc exp)
+          (OneOf {})       -> decltype (proj1)
+        exp = case z of
+          (ZipWith op _ _) -> compileOp op [cexp|$id:proj1|] [cexp|$id:proj2|]
+          (OneOf {}) -> let
+            p1 = msg `Set.member` deps1
+            p2 = msg `Set.member` deps2
+            in if p1 && not p2
+              then [cexp|$id:proj1|]
+              else if not p1 && p2
+                then [cexp|$id:proj2|]
+                else if p1 && p2
+                  then error [qc|Impossible merge.|]
+                  else error [qc|Internal invariant violated __FILE__:__LINE__|]
 
 cnm :: String -> String
 cnm = rawIden . cname
@@ -499,17 +535,21 @@ cleanupMsgGzip msg = do
                * waitpid($id:(fdName msg).pid, NULL, 0); */
                 ;}|]
 
+-- x = sum(trade.price * quote.bid_size)
+-- y = quote.ask_size
+-- x + y
+intermediate :: AST TAQ
+intermediate = GroupByExp symbol $ Foldl Add trade_price
+  where
+    symbol      = ZipExp $ OneOf
+      (ProjectExp $ Projection taq "trade" "Symbol")
+      (ProjectExp $ Projection taq "quote" "Symbol")
+    trade_price = ProjectExp $ Projection taq "trade" "Price"
+    ask_size    = ProjectExp $ Projection taq "quote" "Ask Size"
+    bid_size    = ProjectExp $ Projection taq "quote" "Bid Size"
+
 program = do
-  intermediate1 <- compileAST taqCSpec handlerPlain $
-    -- x = sum(trade.price * quote.bid_size)
-    -- y = quote.ask_size
-    -- x + y
-    ZipExp $ ZipWith Add
-      (ProjectExp $ Projection taq "quote" "Ask Size")
-      $ FoldExp $ Foldl Add $
-        ZipExp $ ZipWith Mul
-          (ProjectExp $ Projection taq "trade" "Price")
-          (ProjectExp $ Projection taq "quote" "Bid Size")
+  intermediate1 <- compileAST taqCSpec handlerPlain intermediate
   intermediate2 <- compileAST taqCSpec handlerPlain $ FoldExp $ Foldl Add
     $ ProjectExp $ Projection taq "trade" "Price"
   cmain taqCSpec (mconcat $ handlers intermediate1) taq
