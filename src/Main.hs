@@ -92,26 +92,46 @@ compileAST spec handler ast = case ast of
 data ASTState a = ASTState
   { src      :: String
   , deps     :: Set (Message a)
-  , handlers :: C.MsgHandler a
+  , handlers :: [C.MsgHandler a]
   }
+
+{-
+compileGroupBy :: Ord a => ASTState a -> Fold (ASTState a) -> C (ASTState a)
+compileGroupBy (ASTState src1 deps1 handlers1) (Foldl op (ASTState src2 deps2 handlers2)) = do
+  id <- mkId
+  return $ ASTState id deps $ C.MsgHandler
+    { _handleMsg  = handleMsg id src1 src2 deps1 deps2
+    , _initMsg    = mempty_
+    , _cleanupMsg = mempty_
+    }
+  where
+    mkId  = C.genId [qc|group_by|]
+    mapTy = cpp_unordered_map (decltype src1) (decltype src2)
+    handleMsg id src1 src2 deps1 deps2 msg = do
+      mapty <- mapTy
+      topDecl [cdecl|$ty:mapty $id:id;|]
+      return undefined
+-}
+
+decltype :: String -> C.Type
+decltype id = [cty|typename $id:("decltype("<>id<>")")|]
 
 compileFold :: Ord a => Fold (ASTState a) -> C (ASTState a)
 compileFold (Foldl op (ASTState {..})) = do
   id <- mkId
-  return $ ASTState id deps $ C.MsgHandler
-    { _handleMsg  = handleMsg handlers id src deps
-    , _initMsg    = _initMsg handlers
-    , _cleanupMsg = _cleanupMsg handlers
+  return $ ASTState id deps $ snoc handlers $ C.MsgHandler
+    { _handleMsg  = handleMsg id
+    , _initMsg    = mempty_
+    , _cleanupMsg = mempty_
     }
   where
     mkId          = C.genId [qc|fold|]
     init          = 0::Int
-    handleMsg spec id proj deps msg = do
-      topDecl [cdecl|$ty:auto $id:id = $init;|]
-      handler <- _handleMsg spec msg
+    handleMsg id msg = do
+      topDecl [cdecl|$ty:(decltype src) $id:id;|]
       return $ if msg `elem` deps
-        then handler `snoc` [cstm|$id:id = $exp;|]
-        else handler
+        then [[cstm|$id:id = $exp;|]]
+        else []
       where
         exp = compileOp op [cexp|$id:id|] [cexp|$id:src|]
 
@@ -120,22 +140,19 @@ compileZip (ZipWith op ast1 ast2) = do
   id <- mkId
   let ASTState src1 deps1 spec1 = ast1
   let ASTState src2 deps2 spec2 = ast2
-  return $ ASTState id (deps1 <> deps2) $ C.MsgHandler
-    { _handleMsg  = handleMsg id spec1 spec2 deps1 deps2 src1 src2
-    , _initMsg    = _initMsg spec1    -- TODO get both?
-    , _cleanupMsg = _cleanupMsg spec1 -- TODO get both?
+  return $ ASTState id (deps1 <> deps2) $ snoc (spec1<>spec2) $ C.MsgHandler
+    { _handleMsg  = handleMsg id deps1 deps2 src1 src2
+    , _initMsg    = mempty_
+    , _cleanupMsg = mempty_
     }
   where
     fnm              = cnm . _name
     mkId             = C.genId [qc|zip|]
-    handleMsg id spec1 spec2 deps1 deps2 proj1 proj2 msg = do
+    handleMsg id deps1 deps2 proj1 proj2 msg = do
       topDecl [cdecl|$ty:auto $id:id = 0;|]
-      handler1 <- (_handleMsg spec1) msg
-      handler2 <- (_handleMsg spec2) msg
-      let handler = nub $ handler1 ++ handler2 -- will this work?
       return $ if msg `Set.member` (deps1 <> deps2)
-        then handler `snoc` [cstm|$id:id = $exp;|]
-        else handler
+        then [[cstm|$id:id = $exp;|]]
+        else []
       where
         exp = compileOp op [cexp|$id:proj1|] [cexp|$id:proj2|]
 
@@ -148,10 +165,10 @@ compileProjection :: Ord a => C.Specification a
   -> C (ASTState a)
 compileProjection (Specification {..}) (MsgHandler {..}) p = do
   id <- C.genId pname
-  return $ ASTState id (Set.singleton pmsg) $ C.MsgHandler
-    { _initMsg    = _initMsg
+  return $ ASTState id (Set.singleton pmsg) $ pure $ C.MsgHandler
+    { _initMsg    = mempty_
     , _handleMsg  = handleMsg id
-    , _cleanupMsg = _cleanupMsg
+    , _cleanupMsg = mempty_
     }
   where
     pname = intercalate "_" $ cnm <$> [_namespace proto, m, f]
@@ -495,7 +512,7 @@ program = do
           (ProjectExp $ Projection taq "quote" "Bid Size")
   intermediate2 <- compileAST taqCSpec handlerPlain $ FoldExp $ Foldl Add
     $ ProjectExp $ Projection taq "trade" "Price"
-  cmain taqCSpec (handlers intermediate1) taq
+  cmain taqCSpec (mconcat $ handlers intermediate1) taq
 
 main = do
 

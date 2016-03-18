@@ -1,5 +1,6 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE RecordWildCards #-}
 module Protocol.Backend.C.Base where
 
@@ -16,7 +17,10 @@ import           Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
 import           Text.InterpolatedString.Perl6 (qc)
 
 import           Data.Bits
+
 import           Utils
+import           Data.Monoid
+
 import           Control.Monad
 
 data Specification a = Specification
@@ -29,6 +33,21 @@ data MsgHandler a = MsgHandler
   , _initMsg    :: Message a -> C [C.Stm]
   , _cleanupMsg :: Message a -> C [C.Stm]
   }
+
+-- non-overlapping monoid instance for (a -> m b)
+mempty_ :: (Applicative t, Monoid m) => (a -> t m)
+mempty_ _ = pure mempty
+mappend_ :: (Applicative t, Monoid m) => (a -> t m) -> (a -> t m) -> (a -> t m)
+mappend_ f g = \a -> (<>) <$> f a <*> g a
+
+instance Monoid (MsgHandler a) where
+  mempty = MsgHandler empty empty empty
+    where empty = const (return mempty)
+  mappend (MsgHandler h1 i1 c1) (MsgHandler h2 i2 c2) = MsgHandler h3 i3 c3
+    where
+      h3 = h1 `mappend_` h2
+      i3 = i1 `mappend_` i2
+      c3 = c1 `mappend_` c2
 
 cstruct :: String -> [C.FieldGroup] -> C C.Type
 cstruct name membs = do
