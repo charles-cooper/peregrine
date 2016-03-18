@@ -56,7 +56,7 @@ data Projection a = Projection
   , _pfieldName :: String
   }
 
-data Op = Add | Mul
+data Op = Add | Mul | Div
 
 data Fold a
   = Foldl { foldop :: Op, foldsrc :: a } -- TODO initializer?
@@ -71,6 +71,11 @@ data AST a
   | FoldExp (Fold (AST a))
   | ProjectExp (Projection a)
   | ObserveExp (Maybe String) (AST a)
+  | ConstExp Constant
+
+data Constant
+  = ConstInt Int
+  | ConstDouble Double
 
 set :: Ord a => [a] -> Set a
 set = Set.fromList
@@ -78,6 +83,7 @@ set = Set.fromList
 compileOp :: Op -> (C.Exp -> C.Exp -> C.Exp)
 compileOp Add = (+)
 compileOp Mul = (*)
+compileOp Div = (/)
 
 compileAST :: Ord p
   => C.Specification p
@@ -105,6 +111,7 @@ compileAST spec handler ast = case ast of
   ObserveExp mdesc ast -> do
     st <- compileAST spec handler ast
     compileObservation mdesc spec ast st
+  ConstExp int -> compileConst int
 
 data ASTState p = ASTState
   { src      :: String
@@ -114,6 +121,25 @@ data ASTState p = ASTState
 
 auto :: C.Type
 auto = [cty|typename $id:("auto")|]
+
+compileConst :: Constant -> C (ASTState p)
+compileConst constant = do
+  id <- C.genId "constant"
+  return $ ASTState id (Set.empty) $ pure $ C.MsgHandler
+    { _handleMsg  = init id
+    , _initMsg    = mempty_
+    , _cleanupMsg = mempty_
+    }
+  where
+    init id _ = do
+      topDecl [cdecl|/*const*/ $ty:ty $id:id = $value;|]
+      return []
+    value = case constant of
+      ConstInt int -> [cexp|$int|]
+      ConstDouble d -> [cexp|$d|]
+    ty = case constant of
+      ConstInt _    -> ulong
+      ConstDouble _ -> [cty|double|]
 
 compileObservation :: Ord p
   => Maybe String
@@ -560,11 +586,33 @@ intermediate = observe $ GroupByExp symbol $ Foldl Add trade_share
     ask_size    = ProjectExp $ Projection taq "quote" "Ask Size"
     bid_size    = ProjectExp $ Projection taq "quote" "Bid Size"
 
+{-
+vwap :: AST TAQ
+vwap = ObserveExp (Just "vwap") vwap
+  where
+    -- multiply by 1.0 to force cast
+    price  = ZipExp $ ZipWith Mul
+      (ConstExp (ConstDouble 1.0))
+      (ProjectExp $ Projection taq "trade" "Price")
+    shares = ProjectExp $ Projection taq "trade" "Shares"
+    symbol = ProjectExp $ Projection taq "trade" "Symbol"
+    vwap   = GroupByExp symbol $ Foldl Add $
+      ZipExp $ ZipWith Div
+        (FoldExp $ Foldl Add (ZipExp $ ZipWith Mul price shares))
+        (FoldExp $ Foldl Add (ConstExp (ConstDouble 1.0)))
+-}
+
 program = do
   intermediate1 <- compileAST taqCSpec handlerPlain intermediate
   intermediate2 <- compileAST taqCSpec handlerPlain $ ObserveExp (Just "Sum price") $ FoldExp $ Foldl Add
     $ ProjectExp $ Projection taq "trade" "Price"
-  cmain taqCSpec (mconcat $ handlers intermediate1 ++ handlers intermediate2)
+  intermediate3 <- compileAST taqCSpec handlerPlain $
+    ObserveExp (Just "count trades") $ GroupByExp
+      (ProjectExp $ Projection taq "trade" "Symbol")
+      (Foldl Add (ConstExp (ConstInt 1)))
+  -- intermediate4 <- compileAST taqCSpec handlerPlain vwap
+
+  cmain taqCSpec (mconcat . mconcat $ handlers <$> [intermediate1, intermediate2, intermediate3])
 
 main = do
 
