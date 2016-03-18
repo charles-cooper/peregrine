@@ -49,8 +49,11 @@ data Merge a
   = Tip (Message a)
   | Node String (Map String (Merge a))
 
-data Projection a
-  = Projection { projNames :: [String], projsrc :: (Merge a) }
+data Projection a = Projection
+  { _pproto     :: (Proto a)
+  , _pmsgName   :: String
+  , _pfieldName :: String
+  }
 
 data Op = Add | Mul
 
@@ -143,15 +146,16 @@ compileProjection :: Ord a => C.Specification a
   -> C.MsgHandler a
   -> Projection a
   -> C (ASTState a)
-compileProjection (Specification {..}) (MsgHandler {..}) p@(Projection ps _) = do
-  id <- C.genId [qc|projection_{pname}|]
+compileProjection (Specification {..}) (MsgHandler {..}) p = do
+  id <- C.genId pname
   return $ ASTState id (Set.singleton pmsg) $ C.MsgHandler
     { _initMsg    = _initMsg
     , _handleMsg  = handleMsg id
     , _cleanupMsg = _cleanupMsg
     }
   where
-    pname = intercalate "_" $ cnm <$> ps
+    pname = intercalate "_" $ cnm <$> [_namespace proto, m, f]
+      where (Projection proto m f) = p
     handleMsg id msg = do
       topDecl =<< declare id <$> _mkTy field
       handler <- _handleMsg msg
@@ -168,8 +172,19 @@ declare id gty = case gty of
 
 fieldsMap :: Message a -> Map String (Field a)
 fieldsMap msg = Map.fromList $ (\field -> (_name field, field)) <$> _fields msg
+msgsMap :: Proto a -> Map String (Message a)
+msgsMap proto = Map.fromList $ (\msg -> (_msgName msg, msg)) <$> _outgoingMessages proto
 
 resolveProjection :: Projection a -> (Field a, Message a)
+resolveProjection (Projection proto msgName fieldName) = (field, msg)
+  where
+    msg = Map.lookup msgName (msgsMap proto)
+      & fromMaybe
+        (error [qc|Message "{msgName}" not found in proto {_namespace proto}|])
+    field = Map.lookup fieldName (fieldsMap msg)
+      & fromMaybe 
+        (error [qc|Field "{fieldName}" not found in message {_msgName msg}|])
+{-
 resolveProjection (Projection [last] (Tip msg)) = (field, msg)
   where
     field = Map.lookup last (fieldsMap msg)
@@ -184,6 +199,7 @@ resolveProjection (Projection (name:xs) (Node _ m)) = resolveProjection next
 resolveProjection (Projection [] n) = error "Projection too many levels deep."
 resolveProjection (Projection xs (Tip {})) = error "Projection too shallow."
 resolveProjection _ = error "Internal invariant violated: impossible case."
+-}
 
 singleton :: Message a -> Merge a
 singleton = Tip
@@ -472,13 +488,13 @@ program = do
     -- y = quote.ask_size
     -- x + y
     ZipExp $ ZipWith Add
-      (ProjectExp $ Projection ["Ask Size"] (Tip quoteFields))
+      (ProjectExp $ Projection taq "quote" "Ask Size")
       $ FoldExp $ Foldl Add $
         ZipExp $ ZipWith Mul
-          (ProjectExp $ Projection ["Price"] (Tip tradeFields))
-          (ProjectExp $ Projection ["Bid Size"] (Tip quoteFields))
+          (ProjectExp $ Projection taq "trade" "Price")
+          (ProjectExp $ Projection taq "quote" "Bid Size")
   intermediate2 <- compileAST taqCSpec handlerPlain $ FoldExp $ Foldl Add
-    $ ProjectExp $ Projection ["Price"] (Tip tradeFields)
+    $ ProjectExp $ Projection taq "trade" "Price"
   cmain taqCSpec (handlers intermediate1) taq
 
 main = do

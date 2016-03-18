@@ -16,7 +16,7 @@ import Data.Text as T (Text, unpack)
 data TAQ = Numeric | Alphabetic | Date | Time | Boolean
   deriving (Eq, Show, Ord)
 taq = Proto
-  { _namespace         = iden "taq"
+  { _namespace         = "taq"
   , _lineSeparated     = True
   , _pktHdrLen         = 0
   , _outgoingMessages  = [dateRecord, tradeFields, quoteFields]

@@ -47,7 +47,7 @@ data Message a = Message
 
 -- data Proxy a = Proxy deriving Show
 data Proto a = Proto
-  { _namespace        :: Iden
+  { _namespace        :: String
   , _lineSeparated    :: Bool
   , _pktHdrLen        :: Int
   , _incomingMessages :: [Message a]
