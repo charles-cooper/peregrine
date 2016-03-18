@@ -39,6 +39,10 @@ import           Data.Set (Set(..))
 
 import Data.Function
 
+----------------------------
+-- DSL
+----------------------------
+
 data Void
 
 data Merge a
@@ -57,6 +61,7 @@ data Zip a b = ZipWith { zipop :: Op, zipsrca :: a, zipsrcb :: b }
 
 data AST a
   = ZipExp (Zip (AST a) (AST a))
+  -- | GroupByExp (AST a) (Fold (AST a))
   | FoldExp (Fold (AST a))
   | ProjectExp (Projection a)
 
@@ -67,10 +72,10 @@ compileOp :: Op -> (C.Exp -> C.Exp -> C.Exp)
 compileOp Add = (+)
 compileOp Mul = (*)
 
-compileAST :: C.Specification TAQ
-  -> C.MsgHandler TAQ
-  -> AST TAQ
-  -> C (ASTState TAQ)
+compileAST :: Ord a => C.Specification a
+  -> C.MsgHandler a
+  -> AST a
+  -> C (ASTState a)
 compileAST spec handler ast = case ast of
   FoldExp (Foldl op ast) -> do
     st <- compileAST spec handler ast
@@ -87,7 +92,7 @@ data ASTState a = ASTState
   , handlers :: C.MsgHandler a
   }
 
-compileFold :: Fold (ASTState TAQ) -> C (ASTState TAQ)
+compileFold :: Ord a => Fold (ASTState a) -> C (ASTState a)
 compileFold (Foldl op (ASTState {..})) = do
   id <- mkId
   return $ ASTState id deps $ C.MsgHandler
@@ -107,7 +112,7 @@ compileFold (Foldl op (ASTState {..})) = do
       where
         exp = compileOp op [cexp|$id:id|] [cexp|$id:src|]
 
-compileZip :: Zip (ASTState TAQ) (ASTState TAQ) -> C (ASTState TAQ)
+compileZip :: Ord a => Zip (ASTState a) (ASTState a) -> C (ASTState a)
 compileZip (ZipWith op ast1 ast2) = do
   id <- mkId
   let ASTState src1 deps1 spec1 = ast1
@@ -134,10 +139,10 @@ compileZip (ZipWith op ast1 ast2) = do
 cnm :: String -> String
 cnm = rawIden . cname
 
-compileProjection :: C.Specification TAQ
-  -> C.MsgHandler TAQ
-  -> Projection TAQ
-  -> C (ASTState TAQ)
+compileProjection :: Ord a => C.Specification a
+  -> C.MsgHandler a
+  -> Projection a
+  -> C (ASTState a)
 compileProjection (Specification {..}) (MsgHandler {..}) p@(Projection ps _) = do
   id <- C.genId [qc|projection_{pname}|]
   return $ ASTState id (Set.singleton pmsg) $ C.MsgHandler
@@ -148,7 +153,7 @@ compileProjection (Specification {..}) (MsgHandler {..}) p@(Projection ps _) = d
   where
     pname = intercalate "_" $ cnm <$> ps
     handleMsg id msg = do
-      topDecl =<< declare id <$> mkTy field
+      topDecl =<< declare id <$> _mkTy field
       handler <- _handleMsg msg
       return $ if pmsg == msg
         then handler `snoc`
@@ -197,6 +202,10 @@ mergeStruct n@(Node name merges) = do
     mkMember n = do
       struct <- mergeStruct n
       return [csdecl|$ty:struct $id:(name_ n);|]
+
+------------------------------------
+-- TMX TAQ
+------------------------------------
 
 taqCSpec :: C.Specification TAQ
 taqCSpec = C.Specification
@@ -459,10 +468,15 @@ cleanupMsgGzip msg = do
 
 program = do
   intermediate1 <- compileAST taqCSpec handlerPlain $
-    FoldExp $ Foldl Add $
-      ZipExp $ ZipWith Mul
-        (ProjectExp $ Projection ["Price"] (Tip tradeFields))
-        (ProjectExp $ Projection ["Bid Size"] (Tip quoteFields))
+    -- x = sum(trade.price * quote.bid_size)
+    -- y = quote.ask_size
+    -- x + y
+    ZipExp $ ZipWith Add
+      (ProjectExp $ Projection ["Ask Size"] (Tip quoteFields))
+      $ FoldExp $ Foldl Add $
+        ZipExp $ ZipWith Mul
+          (ProjectExp $ Projection ["Price"] (Tip tradeFields))
+          (ProjectExp $ Projection ["Bid Size"] (Tip quoteFields))
   intermediate2 <- compileAST taqCSpec handlerPlain $ FoldExp $ Foldl Add
     $ ProjectExp $ Projection ["Price"] (Tip tradeFields)
   cmain taqCSpec (handlers intermediate1) taq
