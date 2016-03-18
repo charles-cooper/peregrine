@@ -24,7 +24,8 @@ import           Data.Monoid
 import           Control.Monad
 
 data Specification a = Specification
-  { _mkTy       :: Field a -> C C.GType
+  { _proto      :: Proto a
+  , _mkTy       :: Field a -> C C.GType
   , _readMember :: Int -> Field a -> C C.Stm
   }
 
@@ -87,10 +88,10 @@ readStruct spec@(Specification {..}) msg = do
     ofsts             = scanl (+) 0 (_len <$> _fields msg)
     stms              = zipWithM _readMember ofsts (_fields msg)
  
-mainLoop :: Specification a -> MsgHandler a -> Proto a -> C C.Func
-mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
+mainLoop :: Specification a -> MsgHandler a -> C C.Func
+mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
   include "stdio.h"
-  cases <- forM (_outgoingMessages proto) $ \msg -> do
+  cases <- forM (_outgoingMessages _proto) $ \msg -> do
     readMsg   <- readStruct spec msg
     struct    <- require $ genStruct spec msg
     handleMsg <- _handleMsg msg
@@ -98,7 +99,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
  
     return [cstm|case $exp:(_tag msg) : {
  
-      if (fread(buf, 1, $(bodyLen proto msg), stdin) == 0) {
+      if (fread(buf, 1, $(bodyLen _proto msg), stdin) == 0) {
         return -1;
       }
       /* parse struct */
@@ -109,7 +110,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
       break;
  
     }|]
-  structs <- forM (_outgoingMessages proto) $ \msg -> do
+  structs <- forM (_outgoingMessages _proto) $ \msg -> do
     struct <- require $ genStruct spec msg
     return [csdecl|struct $id:(_msgName msg) $id:(_msgName msg);|]
  
@@ -132,12 +133,12 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
     }
   |]
  
-cmain :: Specification a -> MsgHandler a -> Proto a -> C C.Func
-cmain spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
+cmain :: Specification a -> MsgHandler a -> C C.Func
+cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
   include "cstdio"
-  loopStep     <- mainLoop spec handler proto
-  initMsgs     <- _initMsg `mapM` _outgoingMessages proto
-  cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages proto
+  loopStep     <- mainLoop spec handler
+  initMsgs     <- _initMsg `mapM` _outgoingMessages _proto
+  cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages _proto
  
   depends [cfun|int main(int argc, char **argv) {
     $stms:(concat initMsgs)
@@ -159,8 +160,8 @@ cmain spec@(Specification {..}) handler@(MsgHandler {..}) proto = do
  
   }|]
   where
-    bufLen     = maximum $ foreach (_outgoingMessages proto) $
-      rotateL (1::Int) . (+1) . logBase2 . bodyLen proto
+    bufLen     = maximum $ foreach (_outgoingMessages _proto) $
+      rotateL (1::Int) . (+1) . logBase2 . bodyLen _proto
  
     logBase2 x = finiteBitSize x - 1 - countLeadingZeros x
 

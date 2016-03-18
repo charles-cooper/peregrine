@@ -70,6 +70,7 @@ data AST a
   | GroupByExp (AST a) (Fold (AST a))
   | FoldExp (Fold (AST a))
   | ProjectExp (Projection a)
+  | ObserveExp (Maybe String) (AST a)
 
 set :: Ord a => [a] -> Set a
 set = Set.fromList
@@ -78,10 +79,11 @@ compileOp :: Op -> (C.Exp -> C.Exp -> C.Exp)
 compileOp Add = (+)
 compileOp Mul = (*)
 
-compileAST :: Ord a => C.Specification a
-  -> C.MsgHandler a
-  -> AST a
-  -> C (ASTState a)
+compileAST :: Ord p
+  => C.Specification p
+  -> C.MsgHandler p
+  -> AST p
+  -> C (ASTState p)
 compileAST spec handler ast = case ast of
   FoldExp (Foldl op ast) -> do
     st <- compileAST spec handler ast
@@ -100,12 +102,57 @@ compileAST spec handler ast = case ast of
     st2 <- compileAST spec handler ast
     compileGroupBy st1 (Foldl op st2)
   ProjectExp p -> compileProjection spec handler p
+  ObserveExp mdesc ast -> do
+    st <- compileAST spec handler ast
+    compileObservation mdesc spec ast st
 
-data ASTState a = ASTState
+data ASTState p = ASTState
   { src      :: String
-  , deps     :: Set (Message a)
-  , handlers :: [C.MsgHandler a]
+  , deps     :: Set (Message p)
+  , handlers :: [C.MsgHandler p]
   }
+
+auto :: C.Type
+auto = [cty|typename $id:("auto")|]
+
+compileObservation :: Ord p
+  => Maybe String
+  -> C.Specification p
+  -> AST p
+  -> ASTState p
+  -> C (ASTState p)
+compileObservation mdesc spec ast (ASTState src deps handlers) = do
+  return $ ASTState src deps $ snoc handlers $ C.MsgHandler
+    { _handleMsg  = mempty_
+    , _initMsg    = mempty_
+    , _cleanupMsg = printer
+    }
+  where
+    -- busted busted busted
+    printer msg = return $ if msg == head (_outgoingMessages (_proto spec))
+      then case ast of
+        GroupByExp {} -> [cstms|
+          printf($desc);
+          for ($ty:auto it = $id:src.begin(); it != $id:src.end(); ++it) {
+            printf("  %.8s: %d\n", &it->first, it->second);
+          }
+        |]
+        FoldExp {} -> [cstms|
+          printf($(desc ++ "%d\n"), $id:src);
+        |]
+      else mempty
+    desc = maybe "" (++": ") mdesc
+    inferType ast = case ast of
+      ObserveExp _ a           -> inferType a
+      FoldExp (Foldl _ a)      -> inferType a
+      ZipExp (OneOf a b)       -> inferType a -- assert equals?
+      ZipExp (ZipWith _ a b)   -> inferType a -- assert equals?
+      ProjectExp p             -> do
+        t <- _mkTy spec $ fst $ resolveProjection p
+        return $ Simple t
+      GroupByExp k (Foldl _ v) -> CPPMap <$> (inferType k) <*> (inferType v)
+
+data GType2 = Simple C.GType | CPPMap GType2 GType2
 
 compileGroupBy :: Ord a => ASTState a -> Fold (ASTState a) -> C (ASTState a)
 compileGroupBy (ASTState key deps1 handlers1) (Foldl op (ASTState value deps2 handlers2)) = do
@@ -172,7 +219,9 @@ compileZip z = do
     mkId             = C.genId [qc|zip|]
     handleMsg id deps1 deps2 proj1 proj2 msg = do
       topDecl [cdecl|$ty:ty $id:id;|]
+      -- ^ TODO don't need this for the temporary OneOf variable
       return $ if msg `Set.member` (deps1 <> deps2)
+      -- ^ TODO abstract this out somehow.
         then [[cstm|$id:id = $exp;|]]
         else []
       where
@@ -195,7 +244,8 @@ compileZip z = do
 cnm :: String -> String
 cnm = rawIden . cname
 
-compileProjection :: Ord a => C.Specification a
+compileProjection :: Ord a
+  => C.Specification a
   -> C.MsgHandler a
   -> Projection a
   -> C (ASTState a)
@@ -237,22 +287,6 @@ resolveProjection (Projection proto msgName fieldName) = (field, msg)
     field = Map.lookup fieldName (fieldsMap msg)
       & fromMaybe 
         (error [qc|Field "{fieldName}" not found in message {_msgName msg}|])
-{-
-resolveProjection (Projection [last] (Tip msg)) = (field, msg)
-  where
-    field = Map.lookup last (fieldsMap msg)
-      & fromMaybe
-        (error [qc|Field "{last}" not found in message {_msgName msg}|])
-
-resolveProjection (Projection (name:xs) (Node _ m)) = resolveProjection next
-  where
-    next = Projection xs $ Map.lookup name m
-      & fromMaybe (error [qc|"{name}" not found in {Map.keys m}|])
-
-resolveProjection (Projection [] n) = error "Projection too many levels deep."
-resolveProjection (Projection xs (Tip {})) = error "Projection too shallow."
-resolveProjection _ = error "Internal invariant violated: impossible case."
--}
 
 singleton :: Message a -> Merge a
 singleton = Tip
@@ -278,7 +312,8 @@ mergeStruct n@(Node name merges) = do
 
 taqCSpec :: C.Specification TAQ
 taqCSpec = C.Specification
-  { _mkTy       = mkTy
+  { _proto      = taq
+  , _mkTy       = mkTy
   , _readMember = readMember
   }
 
@@ -310,21 +345,6 @@ handleMsgPlain = const (pure [])
 cleanupMsgPlain :: Message a -> C [C.Stm]
 cleanupMsgPlain = const (pure [])
 
-initMsgGroupBy :: Message TAQ -> C C.Stm
-initMsgGroupBy msg = pure noop
-
-handleMsgGroupBy = handleMsgGroupBy__ (C.+=) (getField id "Symbol" taq "trade")
-
-handleMsgGroupBy__ :: (C.Exp -> C.Exp -> C.Stm) -> Field TAQ -> Message TAQ -> C C.Stm
-handleMsgGroupBy__ mkStmt field msg = case _msgName msg of
-  "trade" -> do
-    symbol <- C.simplety <$> mkTy field
-    let price = uint
-    cppmap <- cpp_unordered_map symbol price
-    topDecl [cdecl|$ty:cppmap groupby;|]
-    return $ mkStmt [cexp|groupby[msg.trade.symbol]|] [cexp|msg.trade.price|]
-  _ -> pure noop
-
 traceWith :: (a -> String) -> a -> a
 traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
 trace :: Show a => String -> a -> a
@@ -332,17 +352,6 @@ trace s = traceWith $ ((s++": ")++) . show
 
 showc :: Pretty c => c -> String
 showc = pretty 0 . ppr
-
-cleanupMsgGroupBy :: Message TAQ -> C C.Stm
-cleanupMsgGroupBy msg = case _msgName msg of
-  "trade" -> pure [cstm|
-    for ($ty:auto it = groupby.begin(); it != groupby.end(); ++it) {
-      printf("%.8s %d\n", &it->first, it->second);
-    }|]
-  _ -> pure noop
-
-auto :: C.Type
-auto = [cty|typename $id:("auto")|]
 
 handleMsgGzip :: Message TAQ -> C C.Stm
 handleMsgGzip msg = do
@@ -539,20 +548,23 @@ cleanupMsgGzip msg = do
 -- y = quote.ask_size
 -- x + y
 intermediate :: AST TAQ
-intermediate = GroupByExp symbol $ Foldl Add trade_price
+intermediate = observe $ GroupByExp symbol $ Foldl Add trade_share
   where
+    observe     = ObserveExp $ Just "sum(price*shares)"
     symbol      = ZipExp $ OneOf
       (ProjectExp $ Projection taq "trade" "Symbol")
       (ProjectExp $ Projection taq "quote" "Symbol")
     trade_price = ProjectExp $ Projection taq "trade" "Price"
+    trade_share = ProjectExp $ Projection taq "trade" "Shares"
+    trade_value = ZipExp $ ZipWith Mul trade_price trade_share
     ask_size    = ProjectExp $ Projection taq "quote" "Ask Size"
     bid_size    = ProjectExp $ Projection taq "quote" "Bid Size"
 
 program = do
   intermediate1 <- compileAST taqCSpec handlerPlain intermediate
-  intermediate2 <- compileAST taqCSpec handlerPlain $ FoldExp $ Foldl Add
+  intermediate2 <- compileAST taqCSpec handlerPlain $ ObserveExp (Just "Sum price") $ FoldExp $ Foldl Add
     $ ProjectExp $ Projection taq "trade" "Price"
-  cmain taqCSpec (mconcat $ handlers intermediate1) taq
+  cmain taqCSpec (mconcat $ handlers intermediate1 ++ handlers intermediate2)
 
 main = do
 
@@ -573,5 +585,5 @@ main = do
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
 
-    want ["bin/a.out"]
+    want ["Run a.out"]
 
