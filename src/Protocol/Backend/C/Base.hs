@@ -26,7 +26,7 @@ import           Control.Monad
 data Specification a = Specification
   { _proto      :: Proto a
   , _mkTy       :: Field a -> C C.GType
-  , _readMember :: Int -> Field a -> C C.Stm
+  , _readMember :: C.Exp -> C.Exp -> Field a -> C C.Stm
   }
 
 data MsgHandler a = MsgHandler
@@ -57,10 +57,13 @@ cstruct name membs = do
   }|]
   return [cty|typename $id:("struct "++name)|]
 
+cnm :: String -> String
+cnm = rawIden . cname
+
 genStruct :: Specification a -> Message a -> C C.Type
 genStruct spec msg = do
   decls <- runDecls
-  cstruct (_msgName msg) decls
+  cstruct (cnm $ _msgName msg) decls
   where
     runDecls = mapM declare (_fields msg)
     declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) <$> mkTy f
@@ -83,10 +86,14 @@ readStruct spec@(Specification {..}) msg = do
           $stms:pureStms
         }
       |]
-    funName :: String = [qc|read_{_msgName msg}|]
-    structName        = _msgName msg
+    funName :: String = [qc|read_{structName}|]
+    structName        = cnm $ _msgName msg
     ofsts             = scanl (+) 0 (_len <$> _fields msg)
-    stms              = zipWithM _readMember ofsts (_fields msg)
+    read ofst field   = _readMember
+      [cexp|dst->$id:(cnm (_name field))|]
+      [cexp|buf + $ofst|]
+      field
+    stms              = zipWithM read ofsts (_fields msg)
  
 mainLoop :: Specification a -> MsgHandler a -> C C.Func
 mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
@@ -95,7 +102,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
     readMsg   <- readStruct spec msg
     struct    <- require $ genStruct spec msg
     handleMsg <- _handleMsg msg
-    let prefix = [cexp|msg.$id:(_msgName msg)|]
+    let prefix = [cexp|msg.$id:(cnm $ _msgName msg)|]
  
     return [cstm|case $exp:(_tag msg) : {
  
@@ -103,7 +110,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
         return -1;
       }
       /* parse struct */
-      $id:(getId readMsg) (&msg.$id:(_msgName msg), buf);
+      $id:(getId readMsg) (&msg.$id:(cnm $ _msgName msg), buf);
  
       $stms:(handleMsg)
  
@@ -112,8 +119,9 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
     }|]
   structs <- forM (_outgoingMessages _proto) $ \msg -> do
     struct <- require $ genStruct spec msg
-    return [csdecl|struct $id:(_msgName msg) $id:(_msgName msg);|]
+    return [csdecl|struct $id:(cnm $ _msgName msg) $id:(cnm $ _msgName msg);|]
  
+  include "cassert"
   depends [cfun|
     int handle(char *buf) {
       union {
@@ -125,7 +133,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
       switch (*buf) {
         $stms:cases
         default: {
-          assert("Failed to read tag.");
+          assert(false);
           return -1;
         }
       }
@@ -170,11 +178,11 @@ compile dbg code = s 80 $ ppr $ mkCompUnit code
   where
     s = switch prettyPragma pretty dbg
  
-compileShake :: Bool -> String -> C a -> Rules ()
-compileShake dbg buildDir code = do
+compileShake :: Bool -> String -> String -> C a -> Rules ()
+compileShake dbg buildDir oname code = do
  
-  let src = [qc|{buildDir}/main.cpp|]
-  let out = [qc|{buildDir}/a.out|]
+  let src = [qc|{buildDir}/{oname}.cpp|]
+  let out = [qc|{buildDir}/{oname}|]
  
   src %> \out -> do
     alwaysRerun
@@ -186,9 +194,9 @@ compileShake dbg buildDir code = do
  
     let dbgFlag = switch "-g" "" dbg
     command_ [Cwd buildDir, Shell] -- Compile
-      [qc|g++ -std=c++11 -march=native -O2 {dbgFlag} main.cpp|] []
+      [qc|g++ -std=c++11 -march=native -O2 {dbgFlag} -o {oname} {oname}.cpp|] []
  
     command_ [Cwd buildDir, Shell] -- Grab the demangled assembly
-      [qc|objdump -Cd a.out > main.s|] []
+      [qc|objdump -Cd {oname} > main.s|] []
  
 

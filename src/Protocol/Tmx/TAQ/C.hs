@@ -13,7 +13,7 @@ import Data.List (intercalate)
 
 -- specification for c implementation
 
-taqCSpec :: C.Specification TAQ                                                 
+taqCSpec :: C.Specification TAQ
 taqCSpec = C.Specification
   { _proto      = taq
   , _mkTy       = mkTy
@@ -60,22 +60,18 @@ mkTy f@(Field _ len _ ty _) = do
         | otherwise                = error "Unknown case."
   return ret
 
-readMember ofst f@(Field _ len nm ty _) = case ty of
- 
+readMember dst src f@(Field _ len nm ty _) = case ty of
   Numeric    -> runIntegral
   Alphabetic -> return $ if len == 1
-                  then [cstm|dst->$id:cnm = *$buf;|]
-                  else [cstm|memcpy(&dst->$id:cnm, $buf, $len);|]
-  Boolean    -> return [cstm|dst->$id:cnm = (*$buf == '1');|]
+                  then [cstm|$dst = *$src;|]
+                  else [cstm|memcpy(&$dst, $src, $len);|]
+  Boolean    -> return [cstm|$dst = (*$src == '1');|]
   Date       -> runIntegral
   Time       -> runIntegral
   where
-    buf = [cexp|buf + $ofst|]
     runIntegral = do
-      dep <- cReadIntegral =<< (C.simplety <$> mkTy f)
-      return [cstm|dst->$id:cnm = $id:(C.getId dep) ($buf, $len); |]
- 
-    cnm     = rawIden (cname nm)
+      readInt <- cReadIntegral =<< (C.simplety <$> mkTy f)
+      return [cstm|$dst = $id:(C.getId readInt) ($src, $len); |]
 
 handleMsgGzip :: Message TAQ -> C C.Stm
 handleMsgGzip msg = do

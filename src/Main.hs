@@ -9,6 +9,9 @@ import Protocol.Backend.C.Base as C
 import Protocol.Tmx.TAQ as TAQ
 import Protocol.Tmx.TAQ.C as TAQ
 
+import Protocol.Nasdaq.ITCH.Proto as ITCH
+import Protocol.Nasdaq.ITCH.Proto.C as ITCH
+
 import           Language.C.Quote.C
 import qualified Language.C.Syntax as C
 import qualified Language.C.Smart as C ((+=))
@@ -267,9 +270,6 @@ compileZip z = do
                   then error [qc|Impossible merge.|]
                   else error [qc|Internal invariant violated __FILE__:__LINE__|]
 
-cnm :: String -> String
-cnm = rawIden . cname
-
 compileProjection :: Ord a
   => C.Specification a
   -> C.MsgHandler a
@@ -290,7 +290,7 @@ compileProjection (Specification {..}) (MsgHandler {..}) p = do
       handler <- _handleMsg msg
       return $ if pmsg == msg
         then handler `snoc`
-          [cstm|$id:id = msg.$id:(_msgName msg).$id:fieldName;|]
+          [cstm|$id:id = msg.$id:(cnm $ _msgName msg).$id:fieldName;|]
         else handler
     (field, pmsg)  = resolveProjection p
     fieldName      = cnm $ _name field
@@ -400,11 +400,16 @@ program = do
 
   cmain taqCSpec (mconcat . mconcat $ handlers <$> [intermediate1, intermediate2, intermediate3])
 
+itchProgram = do
+  intermediate <- compileAST itchCSpec handlerPlain $ ProjectExp $ Projection itch "Order Executed With Price" "Executed Shares"
+  cmain itchCSpec (mconcat $ handlers intermediate)
+
 main = do
 
   shakeArgs shakeOptions $ do
 
-    compileShake False "bin" program
+    compileShake False "bin" "a.out" program
+    compileShake False "bin" "runItch" itchProgram
 
     let exe = "bin/a.out"
 
@@ -419,5 +424,6 @@ main = do
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
 
+    want ["bin/runItch"]
     want ["bin/a.out"]
 
