@@ -1,7 +1,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 module Protocol where
 
-import Control.Exception.Base (assert)
+import Control.Exception.Base as GHC (assert)
 import Control.Lens
 import Data.Either
 import Data.List (find, nub, intercalate)
@@ -62,7 +62,7 @@ allMessages :: Proto a -> [Message a]
 allMessages p = p^.incomingMessages ++ p^.outgoingMessages
 
 msgMaybe         :: Eq a => (String -> a) -> Proto t -> String -> Maybe (Message t)
-msgMaybe eqclass proto name  = assert noDupMsgNames findMsg where
+msgMaybe eqclass proto name  = GHC.assert noDupMsgNames findMsg where
   noDupMsgNames = let
     names = (map (view msgName) $ allMessages proto)
     in nub names == names

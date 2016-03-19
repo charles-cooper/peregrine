@@ -4,9 +4,10 @@
 {-# LANGUAGE CPP #-}
 module Main where
 
-import Protocol.Tmx.TAQ as TAQ
 import Protocol
 import Protocol.Backend.C.Base as C
+import Protocol.Tmx.TAQ as TAQ
+import Protocol.Tmx.TAQ.C as TAQ
 
 import           Language.C.Quote.C
 import qualified Language.C.Syntax as C
@@ -15,15 +16,14 @@ import qualified Language.C.Utils as C
 import           Language.C.Utils (C, depends, include, noloc)
 import           Language.C.Utils (topDecl, require)
 import           Language.C.Utils (char, bool, ushort, uint, ulong)
+import           Language.C.Lib
 
-import Data.List (intercalate, sort, nub)
 import Data.Monoid
-import Data.Maybe (listToMaybe, fromMaybe)
-import Data.Char (isSpace)
+import Data.List (intercalate)
+import Data.Maybe
 
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma, Pretty(..))
 import Text.InterpolatedString.Perl6 (q, qc)
-
 import Data.Text as T (unpack)
 
 import Utils
@@ -322,26 +322,15 @@ name_ (Node nm _) = nm
 merge :: String -> [Merge a] -> Merge a
 merge name = Node name . Map.fromList . map (\m -> (name_ m, m))
 
-mergeStruct :: Merge TAQ -> C C.Type
-mergeStruct (Tip msg) = genStruct taqCSpec msg
-mergeStruct n@(Node name merges) = do
+mergeStruct :: C.Specification a -> Merge a -> C C.Type
+mergeStruct spec (Tip msg) = genStruct spec msg
+mergeStruct spec n@(Node name merges) = do
   membs <- mkMember `mapM` (Map.elems merges)
   cstruct name membs
   where
     mkMember n = do
-      struct <- mergeStruct n
+      struct <- mergeStruct spec n
       return [csdecl|$ty:struct $id:(name_ n);|]
-
-------------------------------------
--- TMX TAQ
-------------------------------------
-
-taqCSpec :: C.Specification TAQ
-taqCSpec = C.Specification
-  { _proto      = taq
-  , _mkTy       = mkTy
-  , _readMember = readMember
-  }
 
 handlerPlain :: C.MsgHandler a
 handlerPlain = C.MsgHandler
@@ -349,15 +338,6 @@ handlerPlain = C.MsgHandler
   , _initMsg    = initMsgPlain
   , _cleanupMsg = cleanupMsgPlain
   }
-
--- shamelessly taken from neat-interpolation
-dedent :: String -> String
-dedent s = case minimumIndent s of
-  Just len -> unlines $ map (drop len) $ lines s
-  Nothing  -> s
-  where
-    minimumIndent = listToMaybe . sort . map (length . takeWhile (==' '))
-      . filter (not . null . dropWhile isSpace) . lines
 
 noop :: C.Stm
 noop = [cstm|/*no-op*/(void)0;|]
@@ -375,200 +355,6 @@ traceWith :: (a -> String) -> a -> a
 traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
 trace :: Show a => String -> a -> a
 trace s = traceWith $ ((s++": ")++) . show
-
-showc :: Pretty c => c -> String
-showc = pretty 0 . ppr
-
-handleMsgGzip :: Message TAQ -> C C.Stm
-handleMsgGzip msg = do
-  struct <- require $ genStruct taqCSpec msg
-  return [cstm|write($id:(fdName msg).writefd,
-          &msg.$id:(_msgName msg),
-          sizeof(struct $id:(_msgName msg)));|]
-  where
-    cnm = rawIden . cname . _msgName
-
-cpp_string :: C C.Type
-cpp_string = do
-  include "string"
-  return [cty|typename $id:("std::string")|]
-
-cpp_unordered_map :: C.Type -> C.Type -> C C.Type
-cpp_unordered_map k v = do
-  include "unordered_map"
-  return [cty|typename $id:ty|]
-  where
-    ty :: String = [qc|std::unordered_map<{showc k}, {showc v}>|]
-
-assert :: Bool -> a -> a
-assert pred a = if pred then a else (error "Assertion failed")
-
-symbol :: C C.Type
-symbol = do
-  include "functional"
-  hash <- depends [cedecl|$esc:esc|]
-  depends [cty|struct symbol { $ty:ulong symbol; }|]
-  return [cty|typename $id:("struct symbol")|]
-  where
-    esc = dedent [q|
-      namespace std {
-        template <> struct hash<struct symbol> {
-          uint64_t operator()(const struct symbol& k) const {
-            return hash<uint64_t>()(k.symbol);
-          }
-        };
-        template <> struct equal_to<struct symbol> {
-          bool operator() (const struct symbol& x, const struct symbol& y)
-            const
-          {
-            return equal_to<uint64_t>()(x.symbol, y.symbol);
-          }
-        };
-      }
-    |]
-
-mkTy :: Field TAQ -> C C.GType
-mkTy f@(Field _ len _ ty _) = do
-  symbol__ <- require symbol
-  let ret
-        | ty==Numeric    && len==9 = C.SimpleTy uint
-        | ty==Numeric    && len==7 = C.SimpleTy uint
-        | ty==Numeric    && len==3 = C.SimpleTy ushort
-        | ty==Numeric              = error $ "Unknown integer len for " ++ show f
-        | ty==Alphabetic && len==1 = C.SimpleTy char
-        | ty==Alphabetic           = C.SimpleTy symbol__
-        | ty==Boolean              = assert (len==1) $ C.SimpleTy bool
-        | ty==Date                 = C.SimpleTy uint -- assert?
-        | ty==Time                 = C.SimpleTy uint -- assert?
-        | otherwise                = error "Unknown case."
-  return ret
-
-readMember ofst f@(Field _ len nm ty _) = case ty of
-
-  Numeric    -> runIntegral
-  Alphabetic -> return $ if len == 1
-                  then [cstm|dst->$id:cnm = *$buf;|]
-                  else [cstm|memcpy(&dst->$id:cnm, $buf, $len);|]
-  Boolean    -> return [cstm|dst->$id:cnm = (*$buf == '1');|]
-  Date       -> runIntegral
-  Time       -> runIntegral
-  where
-    buf = [cexp|buf + $ofst|]
-    runIntegral = do
-      dep <- cReadIntegral =<< (C.simplety <$> mkTy f)
-      return [cstm|dst->$id:cnm = $id:(C.getId dep) ($buf, $len); |]
-
-    cnm     = rawIden (cname nm)
-
-cReadIntegral ty = do
-  mapM include ["cstdint", "cassert", "cctype"]
-  depends impl
-  where
-    funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
-    impl = [cfun|
-      $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
-        $ty:ty ret = 0;
-        while (len--) {
-          assert(isdigit(*buf));
-          ret = ret * 10 + (*buf - '0');
-          ++buf;
-        }
-        return ret;
-      }
-    |]
-
-printFmt :: C.Exp -> Message TAQ -> (String, [C.Exp])
-printFmt root msg = let
-  (fmts, ids) = unzip $ fmt <$> _fields msg
-  in (intercalate ", " fmts, mconcat ids)
-  where
-    fmt (Field _ len nm ty _)
-      | ty==Numeric     = ([qc|{nm}: %d|], [exp nm])
-      | ty==Alphabetic  = ([qc|{nm}: %.{len}s|], [[cexp|&$(exp nm)|]])
-      | ty==Boolean     = ([qc|{nm}: %d|], [exp nm])
-      | ty==Date        = ([qc|{nm}: %d|], [exp nm])
-      | ty==Time        = ([qc|{nm}: %d|], [exp nm])
-    exp nm = [cexp|$root.$id:(rawIden $ cname nm)|]
-
-fdName :: Message a -> String
-fdName msg = rawIden $ cname $ _msgName msg
-
-initMsgGzip :: Message a -> C C.Stm
-initMsgGzip msg = do
-  str <- require cpp_string
-  mapM include
-    ["cstdio", "cstdlib", "unistd.h", "sys/types.h", "sys/wait.h", "fcntl.h"]
-  depends [cty|struct spawn { int writefd; int pid; }|]
-  topDecl [cdecl|struct spawn $id:(fdName msg);|]
-  depends [cfun|struct spawn spawn_child(char const *filename, char const *progname, char const *argv0) {
-    int fds[2];
-    int ret;
-    if ((ret = pipe(fds)) < 0) {
-      perror("pipe");
-      exit(ret);
-    }
-    int readfd  = fds[0];
-    int writefd = fds[1];
-
-    int cpid = fork();
-    if (cpid < 0) {
-      perror("fork");
-      exit(1);
-    }
-    /* parent */
-    if (cpid) {
-      close(readfd);
-      struct spawn ret;
-      ret.writefd = writefd;
-      ret.pid     = cpid;
-      return ret;
-    } else {
-      close(writefd);
-      /* stdin from pipe */
-      if ((ret = dup2(readfd, STDIN_FILENO)) < 0) {
-        perror("dup2");
-        exit(ret);
-      }
-      int outfd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-      if (outfd < 0) {
-        perror("open output");
-        exit(outfd);
-      }
-      /* pipe to file */
-      if ((ret = dup2(outfd, STDOUT_FILENO)) < 0) {
-        perror("dup2");
-        exit(ret);
-      }
-      if ((ret = execlp(progname, argv0, 0)) < 0) {
-        perror("execlp");
-        exit(ret);
-      }
-    }
-  }|]
-  str <- require cpp_string
-  let mkStr = [cexp|$id:("std::string")|]
-  return [cstm|{
-    $ty:str filename = $mkStr("out/")
-        + $mkStr(argv[1]) + $mkStr($(outputName :: String));
-    $id:(fdName msg) =
-      spawn_child(filename.c_str(), $codecStr, $(codecStr ++ auxName));
-    }|]
-  where
-    outputName = [qc|.{fdName msg}.{suffix}|]
-    auxName    = [qc| ({fdName msg})|]
-    suffix     = "gz"
-    codecStr   = "gzip"
-
-cleanupMsgGzip :: Message a -> C C.Stm
-cleanupMsgGzip msg = do
-  initMsgGzip msg -- pull dependencies
-  return [cstm|{close  ($id:(fdName msg).writefd);
-              /* don't wait for them or else strange hang occurs.
-               * without waiting, there is a small race condition between
-               * when the parent finishes and when the gzip children finish.
-               * fprintf(stderr, "Waiting %d\n", $id:(fdName msg).pid);
-               * waitpid($id:(fdName msg).pid, NULL, 0); */
-                ;}|]
 
 -- x = sum(trade.price * quote.bid_size)
 -- y = quote.ask_size
@@ -633,5 +419,5 @@ main = do
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
 
-    want ["Run a.out"]
+    want ["bin/a.out"]
 
