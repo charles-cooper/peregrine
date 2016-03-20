@@ -197,6 +197,6 @@ compileShake dbg buildDir oname code = do
       [qc|g++ -std=c++11 -march=native -O2 {dbgFlag} -o {oname} {oname}.cpp|] []
  
     command_ [Cwd buildDir, Shell] -- Grab the demangled assembly
-      [qc|objdump -Cd {oname} > main.s|] []
+      [qc|objdump -Cd {oname} > {oname}.s|] []
  
 
