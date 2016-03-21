@@ -411,19 +411,30 @@ main = do
     compileShake False "bin" "runTmx" program
     compileShake False "bin" "runItch" itchProgram
 
-    let exe = "bin/runTmx"
-
-    "data/*.lz4" %> \out -> do
+    "data/*TradesAndQuotesDaily.lz4" %> \out -> do
       let src = "/mnt/efs/ftp/tmxdatalinx.com" </> (takeFileName out) -<.> "gz"
       need [src]
       command [Shell] [qc|gzip -d < {src} | lz4 -9 > {out}|] []
 
-    let date = "20150826"
     phony "Run runTmx" $ do
+      let date = "20150826"
       let dataFile = [qc|data/{date}TradesAndQuotesDaily.lz4|]
+      let exe = "bin/runTmx"
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
 
-    want ["bin/runItch"]
+    "data/*NASDAQ_ITCH50.lz4" %> \out -> do
+      let src = "/mnt/efs/itch" </> (takeFileName out) -<.> "gz"
+      need [src]
+      command [Shell] [qc|gzip -d < {src} | lz4 -9 > {out}|] []
+
+    phony "Run runItch" $ do
+      let date = "12302015"
+      let dataFile = [qc|data/{date}.NASDAQ_ITCH50.lz4|]
+      let exe = "bin/runItch"
+      need [dataFile, exe]
+      command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
+
+    want ["Run runItch"]
     want ["bin/runTmx"]
 

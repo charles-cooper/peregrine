@@ -127,6 +127,9 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
       union {
         $sdecls:structs
       } msg;
+      if (fread(buf, 1, $(_pktHdrLen _proto), stdin) == 0) {
+        return -1;
+      }
       if (fread(buf, 1, 1, stdin) == 0) {
         return -1;
       }
