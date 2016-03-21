@@ -408,10 +408,10 @@ main = do
 
   shakeArgs shakeOptions $ do
 
-    compileShake False "bin" "a.out" program
+    compileShake False "bin" "runTmx" program
     compileShake False "bin" "runItch" itchProgram
 
-    let exe = "bin/a.out"
+    let exe = "bin/runTmx"
 
     "data/*.lz4" %> \out -> do
       let src = "/mnt/efs/ftp/tmxdatalinx.com" </> (takeFileName out) -<.> "gz"
@@ -419,11 +419,11 @@ main = do
       command [Shell] [qc|gzip -d < {src} | lz4 -9 > {out}|] []
 
     let date = "20150826"
-    phony "Run a.out" $ do
+    phony "Run runTmx" $ do
       let dataFile = [qc|data/{date}TradesAndQuotesDaily.lz4|]
       need [dataFile, exe]
       command_ [Shell] [qc|lz4 -d < {dataFile} | {exe} {date} |] []
 
     want ["bin/runItch"]
-    want ["bin/a.out"]
+    want ["bin/runTmx"]
 
