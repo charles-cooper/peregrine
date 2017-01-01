@@ -24,4 +24,6 @@ dedent s = case minimumIndent s of
 assert :: Bool -> a -> a
 assert pred a = if pred then a else (error "Assertion failed")
 
+maybeHead :: Foldable t => t a -> Maybe a
+maybeHead = foldr (\a _ -> Just a) Nothing
 

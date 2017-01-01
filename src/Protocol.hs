@@ -52,7 +52,10 @@ data Proto a = Proto
   , _pktHdrLen        :: Int
   , _incomingMessages :: [Message a]
   , _outgoingMessages :: [Message a]
-  }
+  } deriving (Eq, Ord)
+
+instance Show (Proto a) where
+  show = _namespace
 
 makeLenses ''Proto
 makeLenses ''Field

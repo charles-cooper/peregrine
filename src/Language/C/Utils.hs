@@ -1,5 +1,8 @@
+-- Monad for a C EDSL
+
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Language.C.Utils (
   C,
   GType(..),
@@ -12,13 +15,20 @@ module Language.C.Utils (
   mkCompUnit,
   genId,
   Identifiable(..),
+  idExp,
 
   char,
   bool,
   ushort,
   uint,
   ulong,
+  int,
+  double,
+
+  boolExp,
 ) where
+
+import Language.Utils
 
 import           Language.C.Quote.C
 import qualified Language.C.Syntax as C
@@ -41,26 +51,22 @@ bool   = [cty|typename bool|]
 ushort = [cty|typename uint16_t|]
 uint   = [cty|typename uint32_t|]
 ulong  = [cty|typename uint64_t|]
+int    = [cty|typename int32_t|]
+double = [cty|double|]
 
 data CState = CState
   { _compunit :: CompUnit
-  , _ids      :: Map String Int
+  , _ids      :: IDGenerator
   }
 
--- set which preserves insertion order of its elements
-newtype InsertionSet a = InsertionSet { _imap :: Map a Int }
+-- Bool has no toExp instance
+boolExp :: Bool -> C.Exp
+boolExp True  = [cexp|($ty:bool)1|]
+boolExp False = [cexp|($ty:bool)0|]
 
-instance Ord a => Monoid (InsertionSet a) where
-  mempty = InsertionSet mempty
-  mappend m m' = foldr push m (insertionOrder m')
-
-push :: Ord a => a -> InsertionSet a -> InsertionSet a
-push a (InsertionSet m) = InsertionSet $ case Map.lookup a m of
-  Nothing -> Map.insert a (Map.size m) m
-  Just _  -> m
-
-insertionOrder :: InsertionSet a -> [a]
-insertionOrder = Map.elems . Map.fromList . map swap . Map.toList . _imap
+-- Create an expression from an identifier
+idExp :: String -> C.Exp
+idExp id = [cexp|$id:id|]
 
 data CompUnit = CompUnit
   { includes  :: InsertionSet Includes
@@ -80,20 +86,17 @@ instance Monoid CState where
   mempty = CState mempty mempty
   mappend (CState a b) (CState a' b') = CState (a<>a') (b<>b')
 
+-- TODO come up with better name
 genId :: String -> C String
 genId str = do
   st <- get
-  let (id, newids) = count str $ _ids $ st
-  put $ st { _ids = newids }
-  return $ str ++ "_" ++ show id
-  where
-    count a old = let
-      f _k new old = new + old
-      (mret, new) = Map.insertLookupWithKey f a 1 old
-      in (fromMaybe 0 mret, new)
+  let (id, ids') = newId str (_ids st)
+  put st { _ids = ids' }
+  return id
 
+newtype C a = C { getState :: State CState a }
+  deriving (Functor, Applicative, Monad, MonadState CState)
 
-type C a = State CState a
 depends :: TopLevel a => a -> C a
 depends d = do
   modify (\cstate -> cstate { _compunit = _compunit cstate <>define d } )
@@ -111,7 +114,7 @@ include :: String -> C Includes
 include = depends . Includes
 
 getCompUnit :: C a -> CompUnit
-getCompUnit c = _compunit $ execState c mempty
+getCompUnit c = _compunit $ execState (getState c) mempty
 
 newtype Includes = Includes String deriving (Eq, Ord, Show)
 class TopLevel a where
@@ -141,23 +144,24 @@ noloc = SrcLoc NoLoc
 -- then compile to C AST
 data GType = ArrayTy  { arrayty :: C.Type, arraysize :: Int }
            | SimpleTy { simplety :: C.Type }
+  deriving Eq
 
 mkCompUnit :: C a -> [C.Definition]
 mkCompUnit code = [cunit|
     /* Includes */
-    $edecls:(include <$> insertionOrder incls)
+    $edecls:(include <$> fromInsertionSet incls)
  
     /* Types */
-    $edecls:(typedecl <$> insertionOrder tys)
+    $edecls:(typedecl <$> fromInsertionSet tys)
  
     /* Other definitions */
-    $edecls:(insertionOrder defs)
+    $edecls:(fromInsertionSet defs)
  
     /* Top level declarations */
-    $edecls:(declare <$> insertionOrder decls)
+    $edecls:(declare <$> fromInsertionSet decls)
  
     /* Functions */
-    $edecls:(fundecl <$> insertionOrder funcs)
+    $edecls:(fundecl <$> fromInsertionSet funcs)
   |]
   where
     includeStr header          = [qc|#include <{header::String}>|]

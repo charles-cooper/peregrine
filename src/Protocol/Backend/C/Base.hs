@@ -127,9 +127,11 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
       union {
         $sdecls:structs
       } msg;
+      (void)0;/* Read the packet header if any */
       if (fread(buf, 1, $(_pktHdrLen _proto), stdin) == 0) {
         return -1;
       }
+      (void)0;/* Read the packet type */
       if (fread(buf, 1, 1, stdin) == 0) {
         return -1;
       }
@@ -179,7 +181,9 @@ cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
 compile :: Bool -> C a -> String
 compile dbg code = s 80 $ ppr $ mkCompUnit code
   where
-    s = switch prettyPragma pretty dbg
+    s = if dbg
+      then prettyPragma
+      else pretty
  
 compileShake :: Bool -> String -> String -> C a -> Rules ()
 compileShake dbg buildDir oname code = do
