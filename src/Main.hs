@@ -77,41 +77,29 @@ instance Show (Projection a) where
 data Op = Add | Mul | Div | Sub | Gt | Ge | Lt | Le | Eq
   deriving (Show, Eq, Ord)
 
-fieldsMap :: Message a -> Map String (Field a)
-fieldsMap msg = Map.fromList $ (\field -> (_name field, field)) <$> _fields msg
+type AssocList a b = [(a, b)]
 
-msgsMap :: Proto a -> Map String (Message a)
-msgsMap proto = Map.fromList $ (\msg -> (_msgName msg, msg)) <$> _outgoingMessages proto
+fieldsMap :: Message a -> AssocList String (Field a)
+fieldsMap msg = (\field -> (_name field, field)) <$> _fields msg
+
+msgsMap :: Proto a -> AssocList String (Message a)
+msgsMap proto = (\msg -> (_msgName msg, msg)) <$> _outgoingMessages proto
 
 resolveProjection :: Projection a -> (Field a, Message a)
 resolveProjection (Projection proto msgName fieldName) = (field, msg)
   where
-    msg = Map.lookup msgName (msgsMap proto)
+    msg   = lookup msgName (msgsMap proto)
       & fromMaybe
         (error [qc|Message "{msgName}" not found in proto {_namespace proto}|])
-    field = Map.lookup fieldName (fieldsMap msg)
+    field = lookup fieldName (fieldsMap msg)
       & fromMaybe
         (error [qc|Field "{fieldName}" not found in message {_msgName msg}|])
 
-type Name = Maybe String
-
-type Group a = [Signal a]
-type NodeId  = Int
-
--- front-end peregrine context
-data Context a = Context
-  { nodeId     :: NodeId
-  , nodeGroup  :: Group a
-  , annotation :: Maybe String
-  } deriving (Eq, Ord, Show)
-
--- | This has to be a newtype instead of a type
--- since cycles in type synonyms are not allowed
-newtype Signal a = Signal { getAST :: ASTExp a (Context a) }
+data Constant
+  = ConstInt Int
+  | ConstDouble Double
+  | ConstBool Bool
   deriving (Show, Eq, Ord)
-
--- annotation
-type Ann = Maybe String
 
 data ASTExp
   -- | The protocol
@@ -138,6 +126,31 @@ data ASTExp
   | ConstExp Constant
   deriving (Show, Eq, Ord, Functor, Foldable, Traversable)
 
+-- | This has to be a newtype instead of a type
+-- since cycles in type synonyms are not allowed
+newtype Signal a = Signal { getAST :: ASTExp a (Context a) }
+  deriving (Show, Eq, Ord)
+
+type Group a = [Signal a]
+type NodeId  = Int
+
+-- front-end peregrine context
+data Context a = Context
+  { nodeId     :: NodeId
+  , nodeGroup  :: Group a
+  , annotation :: Maybe String
+  } deriving (Eq, Ord, Show)
+
+incompleteImplementation :: a
+incompleteImplementation = error "Incomplete Num instance for (Signal a)"
+instance Num (Signal a) where
+  fromInteger = Signal . ConstExp . ConstInt . fromInteger
+  (+)    = incompleteImplementation
+  (*)    = incompleteImplementation
+  abs    = incompleteImplementation
+  signum = incompleteImplementation
+  negate = incompleteImplementation
+
 addAnnotation :: String -> ASTExp a (Context a) -> ASTExp a (Context a)
 addAnnotation s ast = case ast of
   ZipWith ctx op a b -> ZipWith (setAnn ctx) op a b
@@ -150,25 +163,12 @@ addAnnotation s ast = case ast of
   where
     setAnn (Context x y _) = Context x y (Just s)
 
+-- Set the C variable name programmatically
 infixr 1 @!
 (@!) :: Peregrine a -> String -> Peregrine a
 p @! ann = do
   sig <- p
   return $ Signal (addAnnotation ann (getAST sig))
-
-data Constant
-  = ConstInt Int
-  | ConstDouble Double
-  | ConstBool Bool
-  deriving (Show, Eq, Ord)
-
--- Monad for Peregrine language. It keeps knowledge of groupBy fences
-type Peregrine a = StateT Int (Reader (Group a)) (Signal a)
-
-groupBy :: Signal a -> Peregrine a -> Peregrine a
-groupBy ast next = do
-  modify (+1)
-  local (ast:) next
 
 isNumericOp :: Op -> Bool
 isNumericOp _ = True -- all numeric for now
@@ -205,32 +205,13 @@ inferCType spec ast = case ast of
         _ -> error "Can't unify array types in ZipWith"
       _ -> error "Can't unify array types in ZipWith"
 
-symbolP :: Peregrine TAQ
-symbolP = do
-  tsymbol <- project taq "trade" "Symbol" @! "tsymbol"
-  qsymbol <- project taq "quote" "Symbol" @! "qsymbol"
-  merge tsymbol qsymbol                   @! "symbol"
+-- Monad for Peregrine language. It keeps knowledge of groupBy fences
+type Peregrine a = StateT Int (Reader (Group a)) (Signal a)
 
-vwapP :: Peregrine TAQ
-vwapP = do
-  s <- symbolP
-  groupBy s $ do
-    px <- project taq "Trade" "Trade Price"
-    sz <- project taq "Trade" "Trade Size"
-    value  <- px *. sz
-    volume <- fold Add sz
-    value /. volume
-
-sumP :: Signal a -> Peregrine a
-sumP xs = fold Add xs
-
-midpointP :: Peregrine TAQ
-midpointP = do
-  bid <- project taq "quote" "Bid Price" @! "bid"
-  ask <- project taq "quote" "Ask Price" @! "ask"
-  x   <- bid +. ask
-  y   <- x /. 2
-  return y                               @! "midpoint"
+groupBy :: Signal a -> Peregrine a -> Peregrine a
+groupBy ast next = do
+  modify (+1)
+  local (ast:) next
 
 getNodeId :: Monad m => StateT Int m Int
 getNodeId = modify (+1) >> get
@@ -247,16 +228,6 @@ project :: Proto a -> String -> String -> Peregrine a
 project p x y = do
   ctx <- peregrineCtx
   return $ Signal (ProjectExp ctx (Projection p x y))
-
-incompleteImplementation :: a
-incompleteImplementation = error "Incomplete Num instance for (Signal a)"
-instance Num (Signal a) where
-  fromInteger = Signal . ConstExp . ConstInt . fromInteger
-  (+)    = incompleteImplementation
-  (*)    = incompleteImplementation
-  abs    = incompleteImplementation
-  signum = incompleteImplementation
-  negate = incompleteImplementation
 
 zipWithP :: Op -> Signal a -> Signal a -> Peregrine a
 zipWithP op x y = do
@@ -352,14 +323,9 @@ type PeregrineC a = StateT (CompState a) C
 
 type AST a = ASTExp a (Context a)
 
-compileConstant :: HandleCont a -> Constant -> PeregrineC a (CompInfo a)
-compileConstant handler c = do
-  return $ CompInfo (const value) Set.empty handler
-  where
-    value = case c of
-      ConstInt    i -> [cexp|$i|]
-      ConstDouble d -> [cexp|$d|]
-      ConstBool   b -> CU.boolExp b
+class (Ord a, Show a) => Constraints a where
+
+instance Constraints TAQ
 
 todo :: String -> a
 todo = error . ("TODO: " ++)
@@ -370,9 +336,43 @@ traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
 trace :: Show a => String -> a -> a
 trace s = traceWith $ ((s++": ")++) . show
 
-class (Ord a, Show a) => Constraints a where
+genLocalId :: String -> Context a -> PeregrineC a String
+-- TODO: generate from a new state for every fence
+genLocalId default_ ctx = lift (CU.genId (cnm id))
+  where
+    id = case annotation ctx of
+      Nothing -> default_
+      Just s  -> s
 
-instance Constraints TAQ
+extendHandler :: HandleCont a -> HandleCont a -> HandleCont a
+extendHandler handler cont = \msg next -> handler msg $ \msg -> cont msg next
+
+withCtx :: C.Exp -> String -> C.Exp
+withCtx ctx x = [cexp|$ctx -> $id:x|]
+
+compileOp :: Op -> C.Exp -> C.Exp -> C.Exp
+compileOp Add x y = [cexp|$x + $y|]
+compileOp Sub x y = [cexp|$x - $y|]
+compileOp Mul x y = [cexp|$x * $y|]
+compileOp Div x y = [cexp|$x / $y|]
+compileOp Gt x y  = [cexp|$x > $y|]
+compileOp Ge x y  = [cexp|$x >= $y|]
+compileOp Lt x y  = [cexp|$x < $y|]
+compileOp Le x y  = [cexp|$x <= $y|]
+compileOp Eq x y  = [cexp|$x == $y|]
+
+-- This works because ASTExp constructors have one or zero `ctx`s
+getCtx :: ASTExp a ctx -> Maybe ctx
+getCtx = foldr (\a b -> Just a) Nothing
+
+compileConstant :: HandleCont a -> Constant -> PeregrineC a (CompInfo a)
+compileConstant handler c = do
+  return $ CompInfo (const value) Set.empty handler
+  where
+    value = case c of
+      ConstInt    i -> [cexp|$i|]
+      ConstDouble d -> [cexp|$d|]
+      ConstBool   b -> CU.boolExp b
 
 compileZipWith :: Constraints a
   => CP.Specification a
@@ -399,8 +399,6 @@ compileZipWith spec handler ctx op x y = do
 
   return $ CompInfo out deps $ extendHandler handler $ \msg next ->
     if msg `Set.member` deps
-      -- don't need to persist if the deps
-      -- for the two signals are equal
       then [cstms|
         $(out msg) = $(zipExp msg);
         $stms:(next msg)
@@ -489,6 +487,52 @@ compileGuard spec handler ctx pred ast = do
        |]
       else next msg
 
+compileLast :: Constraints a
+  => CP.Specification a
+  -> HandleCont a -- idk.
+  -> Context a
+  -> AST a
+  -> PeregrineC a (CompInfo a)
+compileLast spec handler ctx src = do
+  myId <- genLocalId "last" ctx
+  (CompInfo group _ handler) <- groupInfo spec handler (nodeGroup ctx)
+  (CompInfo refFromMsg deps handler) <- compileSignal spec handler src
+  let
+    out m = withCtx (group m) myId
+  return $ CompInfo out deps $ extendHandler handler $ \msg next ->
+    if msg `Set.member` deps
+      then [cstms|
+
+          // Do whatever needs to be done
+          $stms:(next msg)
+
+          // Finally, assign to storage
+          $(out msg) = $exp:(refFromMsg msg);
+        |]
+      else next msg
+
+compileFold :: Constraints a
+  => CP.Specification a
+  -> HandleCont a
+  -> Context a
+  -> Op
+  -> AST a
+  -> PeregrineC a (CompInfo a)
+compileFold spec handler ctx op src = do
+  myId <- genLocalId "fold" ctx
+  (CompInfo group _ handler) <- groupInfo spec handler (nodeGroup ctx)
+  (CompInfo refFromMsg deps handler) <- compileSignal spec handler src
+  let
+    out m = withCtx (group m) myId
+  return $ CompInfo out deps $ extendHandler handler $ \msg next ->
+    let exp msg = compileOp op (out msg) (refFromMsg msg)
+    in if msg `Set.member` deps
+        then [cstms|
+           $(out msg) = $(exp msg);
+           $stms:(next msg)
+         |]
+        else next msg
+
 
 topState :: C.Exp
 topState = [cexp|state|]
@@ -539,126 +583,6 @@ groupInfo spec handler group = case group of
           "Internal invariant violated: Illegally accessed groupBy deps!"
         , handlers = h
         }
-
-extendHandler :: HandleCont a -> HandleCont a -> HandleCont a
-extendHandler handler cont = \msg next -> handler msg $ \msg -> cont msg next
-
-compileLast :: Constraints a
-  => CP.Specification a
-  -> HandleCont a -- idk.
-  -> Context a
-  -> AST a
-  -> PeregrineC a (CompInfo a)
-compileLast spec handler ctx src = do
-  myId <- genLocalId "last" ctx
-  (CompInfo group _ handler) <- groupInfo spec handler (nodeGroup ctx)
-  (CompInfo refFromMsg deps handler) <- compileSignal spec handler src
-  let
-    out m = withCtx (group m) myId
-  return $ CompInfo out deps $ extendHandler handler $ \msg next ->
-    if msg `Set.member` deps
-      then [cstms|
-          $stms:(next msg)
-          $(out msg) = $exp:(refFromMsg msg);
-        |]
-      else next msg
-
-genLocalId :: String -> Context a -> PeregrineC a String
--- TODO: generate from a new state for every fence
-genLocalId default_ ctx = lift (CU.genId (cnm id))
-  where
-    id = case annotation ctx of
-      Nothing -> default_
-      Just s  -> s
-
-compileFold :: Constraints a
-  => CP.Specification a
-  -> HandleCont a
-  -> Context a
-  -> Op
-  -> AST a
-  -> PeregrineC a (CompInfo a)
-compileFold spec handler ctx op src = do
-  myId <- genLocalId "fold" ctx
-  (CompInfo group _ handler) <- groupInfo spec handler (nodeGroup ctx)
-  (CompInfo refFromMsg deps handler) <- compileSignal spec handler src
-  let
-    out m = withCtx (group m) myId
-  return $ CompInfo out deps $ extendHandler handler $ \msg next ->
-    let exp msg = compileOp op (out msg) (refFromMsg msg)
-    in if msg `Set.member` deps
-        then [cstms|
-           $(out msg) = $(exp msg);
-           $stms:(next msg)
-         |]
-        else next msg
-
-withCtx :: C.Exp -> String -> C.Exp
-withCtx ctx x = [cexp|$ctx -> $id:x|]
-
-compileOp :: Op -> C.Exp -> C.Exp -> C.Exp
-compileOp Add x y = [cexp|$x + $y|]
-compileOp Sub x y = [cexp|$x - $y|]
-compileOp Mul x y = [cexp|$x * $y|]
-compileOp Div x y = [cexp|$x / $y|]
-compileOp Gt x y  = [cexp|$x > $y|]
-compileOp Ge x y  = [cexp|$x >= $y|]
-compileOp Lt x y  = [cexp|$x < $y|]
-compileOp Le x y  = [cexp|$x <= $y|]
-compileOp Eq x y  = [cexp|$x == $y|]
-
--- Convert all the high-level Group annotations into low-level
--- C identifiers
-{-
-genCtx :: Constraints a => ASTExp a (NodeId, Maybe (Signal a)) -> C (AST a)
-genCtx ast = evalStateT (mapM step ast) (Nothing, Map.empty)
-  where
-    step (nid, mgroup) = do
-      (toplevel, st) <- get
-      case mgroup of
-        Nothing -> do -- we are at the toplevel
-          case toplevel of
-            Nothing -> do
-              -- first time we have seen the toplevel state
-              id <- lift (CU.idExp <$> CU.genId [qc|state|])
-              put (Just id, st)
-              return Context
-                { nodeId  = nid
-                , fence   = True
-                , groupId = id
-                , group   = mgroup
-                }
-            Just cid -> do
-              return $ Context
-                { nodeId  = nid
-                , fence   = False
-                , groupId = cid
-                , group   = mgroup
-                }
-        Just g  -> do
-          case Map.lookup g st of
-            Nothing -> do
-              -- first time we have seen this groupBy fence.
-              id <- lift (CU.idExp <$> CU.genId [qc|group_by|])
-              put (toplevel, Map.insert g id st)
-              return Context
-                { nodeId  = nid
-                , fence   = True
-                , groupId = id
-                , group   = mgroup
-                }
-            Just cid -> do
-              return Context
-                { nodeId  = nid
-                , fence   = False
-                , groupId = cid
-                , group = mgroup
-                }
--}
-
--- This works because ASTExp constructors have one or zero `ctx`s
-getCtx :: ASTExp a ctx -> Maybe ctx
-getCtx = foldr (\a b -> Just a) Nothing
 
 -- TODO need to build up the groupBy data structure definitions as we go
 
@@ -808,15 +732,42 @@ main = do
     want ["bin/runTmx"]
 -}
 
+symbolP :: Peregrine TAQ
+symbolP = do
+  tsymbol <- project taq "trade" "Symbol" @! "tsymbol"
+  qsymbol <- project taq "quote" "Symbol" @! "qsymbol"
+  merge tsymbol qsymbol                   @! "symbol"
+
+vwapP :: Peregrine TAQ
+vwapP = do
+  s <- symbolP
+  groupBy s $ do
+    px <- project taq "Trade" "Trade Price"
+    sz <- project taq "Trade" "Trade Size"
+    value  <- px *. sz
+    volume <- fold Add sz
+    value /. volume
+
+sumP :: Signal a -> Peregrine a
+sumP xs = fold Add xs
+
+midpointP :: Peregrine TAQ
+midpointP = do
+  bid <- project taq "quote" "Bid Price" @! "bid"
+  ask <- project taq "quote" "Ask Price" @! "ask"
+  x   <- bid +. ask
+  y   <- x /. 2
+  return y                               @! "midpoint"
+
 weightedMidpointP :: Peregrine TAQ
 weightedMidpointP = do
   bidpx  <- project taq "quote" "Bid Price" @! "bidpx"
   bidsz  <- project taq "quote" "Bid Size"  @! "bidsz"
   askpx  <- project taq "quote" "Ask Price" @! "askpx"
   asksz  <- project taq "quote" "Ask Size"  @! "asksz"
-  bidval <- bidpx *. bidsz                  @! "bidval"
-  askval <- askpx *. asksz                  @! "askval"
-  totsz  <- bidsz +. asksz                  @! "totsz"
+  bidval <- bidpx  *. bidsz                 @! "bidval"
+  askval <- askpx  *. asksz                 @! "askval"
+  totsz  <- bidsz  +. asksz                 @! "totsz"
   tmpsum <- bidval +. askval                @! "tmp"
   tmpsum /. totsz                           @! "weighted midpoint"
 
@@ -825,8 +776,8 @@ midpointSkew = do
   symbol <- project taq "quote" "Symbol" @! "symbol" -- symbolP
   groupBy symbol $ do
     normalMid <- midpointP               @! "midpoint"
-    -- weightMid <- weightedMidpointP @! "weighted midpoint"
-    normalMid -. 1                       @! "midpoint skew"
+    weightMid <- weightedMidpointP       @! "weighted midpoint"
+    normalMid -. weightMid               @! "midpoint skew"
 
 simpleProgram :: Peregrine TAQ
 simpleProgram = do
@@ -838,7 +789,7 @@ simpleProgram = do
     sum  <- sumP lbid                       @! "sumbid"
     pred <- sum >. 0                        @! "pred"
     twice_sum <- sum +. sum                 @! "twice sum"
-    x <- guardP pred twice_sum
+    x <- guardP pred sum
     sum /. midp                             @! "weird quantity"
 
 runPeregrine :: Peregrine a -> Signal a
@@ -850,18 +801,20 @@ runIntermediate p = evalStateT p (CompState mempty mempty)
 msgHandler :: Constraints a => Specification a -> Peregrine a -> C (CP.MsgHandler a)
 msgHandler spec peregrine = do
 
-  let iast = getAST (runPeregrine peregrine)
-  (CompInfo _ _ cont) <- runIntermediate (compileSignal spec (\msg cont -> cont msg) iast)
+  let ast = getAST (runPeregrine peregrine)
+  (CompInfo _ _ cont) <- runIntermediate (compileSignal spec endCont ast)
   return $ CP.MsgHandler (\msg -> return (runHandleCont cont msg)) empty empty
   where
-    empty = const (pure [noop])
+    empty   = const (pure [])
+    endCont = \msg cont -> cont msg
 
 -- just generates the message handler for inspection / debugging
 mkHandler :: Peregrine TAQ -> C C.Func
 mkHandler prog = mainLoop taqCSpec =<< msgHandler taqCSpec prog
 
--- This program is a problem because multiple nodes refer to
--- the `bid` node and so it will get compiled twice.
+-- This program represents the sharing problem because multiple nodes refer to
+-- the `bid` node and so it will get compiled twice unless we modulo
+-- the sharing
 problem :: Peregrine TAQ
 problem = do
   bid <- project taq "quote" "Bid Price"
