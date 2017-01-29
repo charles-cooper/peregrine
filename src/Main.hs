@@ -8,6 +8,8 @@
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module Main where
 
@@ -147,6 +149,14 @@ instance Num (Signal a) where
   fromInteger = Signal . ConstExp . ConstInt . fromInteger
   (+)    = incompleteImplementation
   (*)    = incompleteImplementation
+  abs    = incompleteImplementation
+  signum = incompleteImplementation
+  negate = incompleteImplementation
+
+instance Num (Peregrine a) where
+  fromInteger = return . fromInteger
+  a + b       = join $ (+.) <$> a <*> b
+  a * b       = join $ (*.) <$> a <*> b
   abs    = incompleteImplementation
   signum = incompleteImplementation
   negate = incompleteImplementation
