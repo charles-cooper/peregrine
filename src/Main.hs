@@ -345,7 +345,7 @@ genLocalId default_ ctx = lift (CU.genId (cnm id))
       Just s  -> s
 
 extendHandler :: HandleCont a -> HandleCont a -> HandleCont a
-extendHandler handler cont = \msg next -> handler msg $ \msg -> cont msg next
+extendHandler handler cont = \msg next -> handler msg (\msg -> cont msg next)
 
 withCtx :: C.Exp -> String -> C.Exp
 withCtx ctx x = [cexp|$ctx -> $id:x|]
@@ -547,7 +547,8 @@ groupInfo spec handler group = case group of
   g:_ -> do
     st <- groups <$> get
     case Map.lookup group st of
-      Just t  -> return t -- we've already compiled the group
+      -- we've already compiled the group. return the head node of the topsort
+      Just t  -> return t { handlers = handler }
       Nothing -> do
         ret <- genGroupInfo (getAST g)
         modify (\t -> t { groups = Map.insert group ret st })
@@ -607,11 +608,12 @@ compileSignal spec handler ast = case ast of
   ConstExp c -> compileConstant handler c
   where
     -- come up with a better name. basically, only compile the node if it
-    -- hasn't been compiled yet, otherwise just return its existing compilation.
+    -- hasn't been compiled yet, otherwise just return the current head
+    -- of the topsort
     compileOnce nid compilation = do
       mexists <- Map.lookup nid . nodes <$> get
       case mexists of
-        Just compInfo -> return compInfo
+        Just compInfo -> return compInfo { handlers = handler }
         Nothing       -> do
           compInfo <- compilation
           modify $ \st -> st { nodes = Map.insert nid compInfo (nodes st) }
@@ -777,7 +779,7 @@ midpointSkew = do
   groupBy symbol $ do
     normalMid <- midpointP               @! "midpoint"
     weightMid <- weightedMidpointP       @! "weighted midpoint"
-    normalMid -. weightMid               @! "midpoint skew"
+    weightMid -. normalMid               @! "midpoint skew"
 
 simpleProgram :: Peregrine TAQ
 simpleProgram = do
@@ -820,6 +822,16 @@ problem = do
   bid <- project taq "quote" "Bid Price"
   y <- bid +. bid
   bid +. y
+
+zipBug :: Peregrine TAQ
+zipBug = do
+  s <- project taq "quote" "Symbol"
+  groupBy s $ do
+    bid <- project taq "quote" "Bid Price" @! "bid"
+    ask <- project taq "quote" "Ask Price" @! "ask"
+    x   <- bid +. ask                      @! "x"
+    y   <- bid -. ask                      @! "y"
+    x +. y                                 @! "bug"
 
 main = do
   putStrLn $ CP.compile False (mkHandler midpointSkew)
