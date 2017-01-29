@@ -629,14 +629,19 @@ compileSignal spec handler ast = case ast of
           modify $ \st -> st { nodes = Map.insert nid compInfo (nodes st) }
           return compInfo
 
-{-
-sumGroupBy :: AST a -> AST a -> Peregrine a -> Peregrine a
+diff :: Signal a -> Peregrine a
+diff sig = do
+  sig' <- lastP sig
+  sig -. sig' @! "diff"
+
+sumGroupBy :: Signal a -> Peregrine a -> Peregrine a
 sumGroupBy group sig = do
   grouped <- groupBy group $ do
     s <- sig
     diff s
-  sum grouped
+  sumP grouped
 
+{-
 perSymbolOutstanding :: Peregrine a
 perSymbolOutstanding = do
   s   <- symbol
@@ -843,6 +848,14 @@ zipBug = do
     y   <- bid -. ask                      @! "y"
     x +. y                                 @! "bug"
 
+marketBidVal :: Peregrine TAQ
+marketBidVal = (@! "Market Bid Val") $ do
+  s <- symbolP
+  sumGroupBy s $ do
+    bidpx <- project taq "quote" "Bid Price" @! "bid price"
+    bidsz <- project taq "quote" "Bid Size"  @! "Bid size"
+    bidpx *. bidsz                           @! "bid val"
+
 main = do
-  putStrLn $ CP.compile False (mkHandler midpointSkew)
+  putStrLn $ CP.compile False (mkHandler marketBidVal)
 
