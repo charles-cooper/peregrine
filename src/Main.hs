@@ -755,29 +755,27 @@ symbolP = do
   qsymbol <- project taq "quote" "Symbol" @! "qsymbol"
   merge tsymbol qsymbol                   @! "symbol"
 
-vwapP :: Peregrine TAQ
-vwapP = do
-  s <- symbolP
-  groupBy s $ do
-    px <- project taq "Trade" "Trade Price"
-    sz <- project taq "Trade" "Trade Size"
-    value  <- px *. sz
-    volume <- fold Add sz
-    value /. volume
+vwapP :: Signal TAQ -> Peregrine TAQ
+vwapP group = groupBy group $ do
+  px <- project taq "Trade" "Trade Price"
+  sz <- project taq "Trade" "Trade Size"
+  value  <- px *. sz
+  volume <- fold Add sz
+  value /. volume
 
 sumP :: Signal a -> Peregrine a
 sumP xs = fold Add xs
 
-midpointP :: Peregrine TAQ
-midpointP = do
+midpointP :: Signal TAQ -> Peregrine TAQ
+midpointP group = groupBy group $ do
   bid <- project taq "quote" "Bid Price" @! "bid"
   ask <- project taq "quote" "Ask Price" @! "ask"
   x   <- bid +. ask
   y   <- x /. 2
   return y                               @! "midpoint"
 
-weightedMidpointP :: Peregrine TAQ
-weightedMidpointP = do
+weightedMidpointP :: Signal TAQ -> Peregrine TAQ
+weightedMidpointP group = groupBy group $ do
   bidpx  <- project taq "quote" "Bid Price" @! "bidpx"
   bidsz  <- project taq "quote" "Bid Size"  @! "bidsz"
   askpx  <- project taq "quote" "Ask Price" @! "askpx"
@@ -788,19 +786,18 @@ weightedMidpointP = do
   tmpsum <- bidval +. askval                @! "tmp"
   tmpsum /. totsz                           @! "weighted midpoint"
 
-midpointSkew :: Peregrine TAQ
-midpointSkew = do
-  symbol <- project taq "quote" "Symbol" @! "symbol" -- symbolP
-  groupBy symbol $ do
-    normalMid <- midpointP               @! "midpoint"
-    weightMid <- weightedMidpointP       @! "weighted midpoint"
-    weightMid -. normalMid               @! "midpoint skew"
+midpointSkew :: Signal TAQ -> Peregrine TAQ
+midpointSkew group = do
+  normalMid <- midpointP group         @! "midpoint"
+  weightMid <- weightedMidpointP group @! "weighted midpoint"
+  groupBy group $ do
+    weightMid -. normalMid             @! "midpoint skew"
 
-simpleProgram :: Peregrine TAQ
-simpleProgram = do
-  symbol <- project taq "trade" "Symbol"
+simpleProgram :: Signal TAQ -> Peregrine TAQ
+simpleProgram group = do
+  midp   <- midpointP group
+  symbol <- symbolP
   groupBy symbol $ do
-    midp <- midpointP
     bid  <- project taq "quote" "Bid Price" @! "bidpx"
     lbid <- lastP bid                       @! "lastbid"
     sum  <- sumP lbid                       @! "sumbid"
@@ -856,6 +853,11 @@ marketBidVal = (@! "Market Bid Val") $ do
     bidsz <- project taq "quote" "Bid Size"  @! "Bid size"
     bidpx *. bidsz                           @! "bid val"
 
+groupBySymbol :: (Signal TAQ -> Peregrine TAQ) -> Peregrine TAQ
+groupBySymbol signalWithGroup = do
+  symbol <- symbolP
+  signalWithGroup symbol
+
 main = do
-  putStrLn $ CP.compile False (mkHandler marketBidVal)
+  putStrLn $ CP.compile False (mkHandler (groupBySymbol midpointSkew))
 
