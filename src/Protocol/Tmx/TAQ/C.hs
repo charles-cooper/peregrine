@@ -23,8 +23,8 @@ taqCSpec = C.Specification
 symbol :: C C.Type
 symbol = do
   include "functional"
-  hash <- depends [cedecl|$esc:esc|]
   depends [cty|struct symbol { $ty:ulong symbol; }|]
+  hash <- depends [cedecl|$esc:esc|]
   return [cty|typename $id:("struct symbol")|]
   where
     esc = dedent [q|

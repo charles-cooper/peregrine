@@ -19,11 +19,21 @@ module Language.C.Utils (
 
   char,
   bool,
+  double,
+
+  uchar,
   ushort,
   uint,
   ulong,
+
+  schar,
+  short,
   int,
-  double,
+  long,
+
+  isNumeric,
+  signed,
+  width,
 
   boolExp,
 ) where
@@ -46,13 +56,42 @@ import qualified Data.Map as Map
 import           Data.Map (Map(..))
 
 char   = [cty|char|]
-uchar  = [cty|typename uint8_t|]
 bool   = [cty|typename bool|]
+double = [cty|double|]
+
+schar  = [cty|typename int8_t|]
+short  = [cty|typename int16_t|]
+int    = [cty|typename int32_t|]
+long   = [cty|typename int64_t|]
+
+uchar  = [cty|typename uint8_t|]
 ushort = [cty|typename uint16_t|]
 uint   = [cty|typename uint32_t|]
 ulong  = [cty|typename uint64_t|]
-int    = [cty|typename int32_t|]
-double = [cty|double|]
+
+isNumeric :: C.Type -> Bool
+isNumeric ty = ty `elem`
+  [ uchar
+  , ushort
+  , uint
+  , ulong
+  , schar
+  , short
+  , int
+  , long
+  , double
+  ]
+
+signed :: C.Type -> Bool
+signed ty = ty `elem` [schar, short, int, long]
+
+width :: C.Type -> Int
+width ty = case () of
+  _ | ty `elem` [char, schar, uchar]  -> 1
+  _ | ty `elem` [short, ushort]       -> 2
+  _ | ty `elem` [int, uint]           -> 4
+  _ | ty `elem` [long, ulong, double] -> 8
+  _ | otherwise -> error $ "Unknown width for type " <> show ty
 
 data CState = CState
   { _compunit :: CompUnit
@@ -68,19 +107,20 @@ boolExp False = [cexp|($ty:bool)0|]
 idExp :: String -> C.Exp
 idExp id = [cexp|$id:id|]
 
+data Declaration = Def C.Definition | Type C.Type
+  deriving (Eq, Ord)
+
 data CompUnit = CompUnit
   { includes  :: InsertionSet Includes
-  , decls     :: InsertionSet C.Definition
-  -- ^ Useful for inserting raw C++ declarations
-  , typedecls :: InsertionSet C.Type
+  , defs      :: InsertionSet Declaration
   , functions :: InsertionSet C.Func
   , topLevel  :: InsertionSet C.InitGroup
   }
 
 instance Monoid CompUnit where
-  mempty = CompUnit mempty mempty mempty mempty mempty
-  mappend (CompUnit a b c d e) (CompUnit a' b' c' d' e') =
-    CompUnit (a<>a') (b<>b') (c<>c') (d<>d') (e<>e')
+  mempty = CompUnit mempty mempty mempty mempty
+  mappend (CompUnit a b c d) (CompUnit a' b' c' d') =
+    CompUnit (a<>a') (b<>b') (c<>c') (d<>d')
 
 instance Monoid CState where
   mempty = CState mempty mempty
@@ -120,15 +160,15 @@ newtype Includes = Includes String deriving (Eq, Ord, Show)
 class TopLevel a where
   define :: a -> CompUnit
 instance TopLevel Includes where
-  define inc  = CompUnit (single inc) e e e e
+  define inc  = CompUnit (single inc) e e e
 instance TopLevel C.Definition where
-  define def  = CompUnit e (single def) e e e
+  define def  = CompUnit e (single (Def def)) e e
 instance TopLevel C.Type where
-  define ty   = CompUnit e e (single ty) e e
+  define ty   = CompUnit e (single (Type ty)) e e
 instance TopLevel C.Func where
-  define func = CompUnit e e e (single func) e
+  define func = CompUnit e e (single func) e
 instance TopLevel C.InitGroup where
-  define init = CompUnit e e e e (single init)
+  define init = CompUnit e e e (single init)
 
 e :: Monoid m => m
 e = mempty
@@ -152,10 +192,7 @@ mkCompUnit code = [cunit|
     $edecls:(include <$> fromInsertionSet incls)
  
     /* Types */
-    $edecls:(typedecl <$> fromInsertionSet tys)
- 
-    /* Other definitions */
-    $edecls:(fromInsertionSet defs)
+    $edecls:(define <$> fromInsertionSet defs)
  
     /* Top level declarations */
     $edecls:(declare <$> fromInsertionSet decls)
@@ -166,10 +203,11 @@ mkCompUnit code = [cunit|
   where
     includeStr header          = [qc|#include <{header::String}>|]
     include (Includes header)  = [cedecl|$esc:(includeStr header)|]
-    typedecl ty                = [cedecl|$ty:ty;|]
     fundecl func               = [cedecl|$func:func|]
+    define (Def def)           = def
+    define (Type ty)           = [cedecl|$ty:ty;|]
     declare decl               = [cedecl|$decl:decl;|]
-    (CompUnit incls defs tys funcs decls) = getCompUnit code
+    (CompUnit incls defs funcs decls) = getCompUnit code
 
 class Identifiable a where
   getId :: a -> C.Id

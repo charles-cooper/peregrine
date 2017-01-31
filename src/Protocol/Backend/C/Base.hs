@@ -98,6 +98,11 @@ readStruct spec@(Specification {..}) msg = do
 mainLoop :: Specification a -> MsgHandler a -> C C.Func
 mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
   include "stdio.h"
+
+  structs <- forM (_outgoingMessages _proto) $ \msg -> do
+    struct <- require $ genStruct spec msg
+    return [csdecl|struct $id:(cnm $ _msgName msg) $id:(cnm $ _msgName msg);|]
+
   cases <- forM (_outgoingMessages _proto) $ \msg -> do
     readMsg   <- readStruct spec msg
     struct    <- require $ genStruct spec msg
@@ -117,10 +122,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
       break;
  
     }|]
-  structs <- forM (_outgoingMessages _proto) $ \msg -> do
-    struct <- require $ genStruct spec msg
-    return [csdecl|struct $id:(cnm $ _msgName msg) $id:(cnm $ _msgName msg);|]
- 
+
   include "cassert"
   depends [cfun|
     int handle(char *buf) {
@@ -188,8 +190,11 @@ compile dbg code = s 80 $ ppr $ mkCompUnit code
 compileShake :: Bool -> String -> String -> C a -> Rules ()
 compileShake dbg buildDir oname code = do
  
-  let src = [qc|{buildDir}/{oname}.cpp|]
-  let out = [qc|{buildDir}/{oname}|]
+  let
+    src = [qc|{buildDir}/{oname}.cpp|]
+    out = [qc|{buildDir}/{oname}|]
+    cpp = "clang++"
+
  
   src %> \out -> do
     alwaysRerun
@@ -201,7 +206,7 @@ compileShake dbg buildDir oname code = do
  
     let dbgFlag = switch "-g" "" dbg
     command_ [Cwd buildDir, Shell] -- Compile
-      [qc|g++ -std=c++11 -march=native -O2 {dbgFlag} -o {oname} {oname}.cpp|] []
+      [qc|{cpp} -std=c++11 -march=native -O2 {dbgFlag} -o {oname} {oname}.cpp|] []
  
     command_ [Cwd buildDir, Shell] -- Grab the demangled assembly
       [qc|objdump -Cd {oname} > {oname}.s|] []
