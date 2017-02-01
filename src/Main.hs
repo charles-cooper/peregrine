@@ -457,18 +457,19 @@ compileZipWith spec handler ctx op x y = do
     deps       = deps1 <> deps2
     sty1       = CU.simplety ty1
     sty2       = CU.simplety ty2
-    ty         = case () of
-      _ | ty1 == ty2
+    ty         = if
+      | ty1 == ty2
         -> ty1
-      _ | not (CU.isNumeric sty1) || not (CU.isNumeric sty2)
+      | not (CU.isNumeric sty1) || not (CU.isNumeric sty2)
         -> error $ "Can't zip types " <> show sty1 <> ", " <> show sty2
-      _ | op == Div || CU.double `elem` [sty1, sty2]
+      | op == Div || CU.double `elem` [sty1, sty2]
         -> CU.SimpleTy CU.double
-      _ | op `elem` [Add, Mul, Sub] && CU.signed sty1 == CU.signed sty2
+      | op `elem` [Add, Mul, Sub] && CU.signed sty1 == CU.signed sty2
         -> if CU.width sty1 >= CU.width sty2 then ty1 else ty2
-      _ | otherwise
+      | op `elem` [Gt, Ge, Lt, Le, Eq]
+        -> CU.SimpleTy CU.bool
+      | otherwise
         -> error $ "Can't zip numeric types??" <> show sty1 <> ", " <> show sty2
-
 
   return $ CompInfo myId out ty deps $ extendHandler handler $ \msg next ->
     if msg `Set.member` deps
@@ -767,6 +768,7 @@ midpointSkew group = do
   groupBy group $ do
     weightMid -. normalMid             @! "midpoint skew"
 
+-- Nonce program which uses all the AST types
 simpleProgram :: Signal TAQ -> Peregrine TAQ
 simpleProgram group = do
   midp   <- midpointP group
