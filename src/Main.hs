@@ -138,10 +138,16 @@ type NodeId  = Int
 
 -- front-end peregrine context
 data Context a = Context
-  { nodeId     :: NodeId
-  , nodeGroup  :: Group a
+  { nodeGroup  :: Group a
   , annotation :: Maybe String
-  } deriving (Eq, Ord, Show)
+  } deriving (Show)
+-- Special Eq and Ord instances for Context
+-- because we don't want the annotation to have
+-- any effect on map lookups
+instance Eq a => Eq (Context a) where
+  Context group1 _ == Context group2 _ = group1 == group2
+instance Ord a => Ord (Context a) where
+  Context group1 _ `compare` Context group2 _ = group1 `compare` group2
 
 incompleteImplementation :: a
 incompleteImplementation = error "Incomplete Num instance for (Signal a)"
@@ -171,7 +177,7 @@ addAnnotation s ast = case ast of
   LastExp ctx a -> LastExp (setAnn ctx) a
   ConstExp c -> ConstExp c
   where
-    setAnn (Context x y _) = Context x y (Just s)
+    setAnn (Context x _) = Context x (Just s)
 
 -- Set the C variable name programmatically
 infixr 1 @!
@@ -181,18 +187,14 @@ p @! ann = do
   return $ Signal (addAnnotation ann (getAST sig))
 
 -- Monad for Peregrine language. It keeps knowledge of groupBy fences
-type Peregrine a = StateT Int (Reader (Group a)) (Signal a)
+type Peregrine a = Reader (Group a) (Signal a)
 
 groupBy :: Signal a -> Peregrine a -> Peregrine a
 groupBy ast next = do
-  modify (+1)
   local (ast:) next
 
-getNodeId :: Monad m => StateT Int m Int
-getNodeId = modify (+1) >> get
-
-peregrineCtx :: StateT Int (Reader (Group a)) (Context a)
-peregrineCtx = Context <$> getNodeId <*> lift ask <*> pure Nothing
+peregrineCtx :: Reader (Group a) (Context a)
+peregrineCtx = Context <$> ask <*> pure Nothing
 
 merge :: Signal a -> Signal a -> Peregrine a
 merge x y = do
@@ -284,7 +286,9 @@ noop :: C.Stm
 noop = [cstm|/*no-op*/(void)0;|]
 
 data CompState a = CompState
-  { nodes   :: Map NodeId (CompInfo a)
+  -- In the future if these turn out to be not performant,
+  -- we can hash or compress representation of the nodes
+  { nodes   :: Map (AST a) (CompInfo a)
   , groups  :: Map (Group a) (CompInfo a, GroupStruct)
   }
 
@@ -613,32 +617,32 @@ compileSignal :: Constraints a
   -> AST a
   -> PeregrineC a (CompInfo a)
 compileSignal spec handler ast = case ast of
-  FoldExp ctx op ast -> compileOnce ctx $ do
+  FoldExp ctx op ast -> compileOnce ast ctx $ do
     compileFold spec handler ctx op ast
-  ZipWith ctx op ast1 ast2 -> compileOnce ctx $ do
+  ZipWith ctx op ast1 ast2 -> compileOnce ast ctx $ do
     compileZipWith spec handler ctx op ast1 ast2
-  MergeExp ctx ast1 ast2 -> compileOnce ctx $ do
+  MergeExp ctx ast1 ast2 -> compileOnce ast ctx $ do
     compileMerge spec handler ctx ast1 ast2
-  ProjectExp ctx p -> compileOnce ctx $ do
+  ProjectExp ctx p -> compileOnce ast ctx $ do
     compileProjection spec handler ctx p
-  LastExp ctx ast -> compileOnce ctx $ do
+  LastExp ctx ast -> compileOnce ast ctx $ do
     compileLast spec handler ctx ast
-  GuardExp ctx pred ast -> compileOnce ctx $ do
+  GuardExp ctx pred ast -> compileOnce ast ctx $ do
     compileGuard spec handler ctx pred ast
   ConstExp c -> compileConstant handler c
   where
     -- come up with a better name. basically, only compile the node if it
     -- hasn't been compiled yet, otherwise just return the current head
     -- of the topsort
-    compileOnce (Context nid group _) compilation = do
-      mexists <- Map.lookup nid . nodes <$> get
+    compileOnce ast (Context group _) compilation = do
+      mexists <- Map.lookup ast . nodes <$> get
       case mexists of
         Just compInfo -> return compInfo { handlers = handler }
         Nothing       -> do
           compInfo <- compilation
 
           -- mark seen
-          modify $ \st -> st { nodes  = Map.insert nid compInfo (nodes st) }
+          modify $ \st -> st { nodes  = Map.insert ast compInfo (nodes st) }
 
           -- insert its declaration into its container
           let
@@ -740,18 +744,16 @@ sumP xs = fold Add xs
 
 midpointP :: Signal TAQ -> Peregrine TAQ
 midpointP group = groupBy group $ do
-  bid <- project taq "quote" "Bid Price" @! "bid"
-  ask <- project taq "quote" "Ask Price" @! "ask"
-  x   <- bid +. ask
+  x   <- taqBidPrice + taqAskPrice
   y   <- x /. 2
   return y                               @! "midpoint"
 
 weightedMidpointP :: Signal TAQ -> Peregrine TAQ
 weightedMidpointP group = groupBy group $ do
-  bidpx  <- project taq "quote" "Bid Price" @! "bidpx"
-  bidsz  <- project taq "quote" "Bid Size"  @! "bidsz"
-  askpx  <- project taq "quote" "Ask Price" @! "askpx"
-  asksz  <- project taq "quote" "Ask Size"  @! "asksz"
+  bidpx  <- taqBidPrice                     @! "bidpx" -- test CSE working
+  bidsz  <- taqBidSize
+  askpx  <- taqAskPrice
+  asksz  <- taqAskSize
   bidval <- bidpx  *. bidsz                 @! "bidval"
   askval <- askpx  *. asksz                 @! "askval"
   totsz  <- bidsz  +. asksz                 @! "totsz"
@@ -770,7 +772,7 @@ simpleProgram group = do
   midp   <- midpointP group
   symbol <- symbolP
   groupBy symbol $ do
-    bid  <- project taq "quote" "Bid Price" @! "bidpx"
+    bid  <- taqBidPrice
     lbid <- lastP bid                       @! "lastbid"
     sum  <- sumP lbid                       @! "sumbid"
     pred <- sum >. 0                        @! "pred"
@@ -779,7 +781,7 @@ simpleProgram group = do
     sum /. midp                             @! "weird quantity"
 
 runPeregrine :: Peregrine a -> Signal a
-runPeregrine peregrine = runReader (evalStateT peregrine 0) []
+runPeregrine peregrine = runReader peregrine []
 
 runIntermediate :: Constraints a => PeregrineC a b -> C (b, CompState a)
 runIntermediate p = runStateT p (CompState mempty mempty)
@@ -814,7 +816,7 @@ p2c prog = cmain taqCSpec =<< msgHandler taqCSpec prog
 -- the sharing
 problem :: Peregrine TAQ
 problem = do
-  bid <- project taq "quote" "Bid Price"
+  bid <- taqBidPrice
   y <- bid +. bid
   bid +. y
 
@@ -822,11 +824,26 @@ zipBug :: Peregrine TAQ
 zipBug = do
   s <- project taq "quote" "Symbol"
   groupBy s $ do
-    bid <- project taq "quote" "Bid Price" @! "bid"
-    ask <- project taq "quote" "Ask Price" @! "ask"
+    bid <- taqBidPrice
+    ask <- taqAskPrice
     x   <- bid +. ask                      @! "x"
     y   <- bid -. ask                      @! "y"
     x +. y                                 @! "bug"
+
+quoteField :: String -> Peregrine TAQ -- helper func
+quoteField field = project taq "quote" field @! field
+
+taqBidPrice :: Peregrine TAQ
+taqBidPrice = quoteField "Bid Price"
+
+taqBidSize :: Peregrine TAQ
+taqBidSize = quoteField "Bid Size"
+
+taqAskPrice :: Peregrine TAQ
+taqAskPrice = quoteField "Ask Price"
+
+taqAskSize :: Peregrine TAQ
+taqAskSize = quoteField "Ask Size"
 
 marketBidVal :: Peregrine TAQ
 marketBidVal = (@! "Market Bid Val") $ do
@@ -842,6 +859,6 @@ groupBySymbol signalWithGroup = do
   signalWithGroup symbol
 
 main = shakeArgs shakeOptions $ do
-  CP.compileShake True "bin" "peregrine" (p2c (groupBySymbol midpointSkew))
+  CP.compileShake False "bin" "peregrine" (p2c (groupBySymbol midpointSkew))
   want ["bin/peregrine"]
 
