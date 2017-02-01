@@ -44,6 +44,7 @@ executable machine
                      , containers
 
                      , mtl
+                     , data-fix
 
                      , language-c-quote
                      , mainland-pretty
