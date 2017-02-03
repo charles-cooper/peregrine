@@ -124,15 +124,19 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
     }|]
 
   include "cassert"
+  let readHeader = if _pktHdrLen _proto > 0
+        then [cstms|
+          if (fread(buf, 1, $(_pktHdrLen _proto), stdin) == 0) {
+            return -1;
+          }|]
+        else []
   depends [cfun|
     int handle(char *buf) {
       union {
         $sdecls:structs
       } msg;
       (void)0;/* Read the packet header if any */
-      if (fread(buf, 1, $(_pktHdrLen _proto), stdin) == 0) {
-        return -1;
-      }
+      $stms:readHeader
       (void)0;/* Read the packet type */
       if (fread(buf, 1, 1, stdin) == 0) {
         return -1;
@@ -164,9 +168,6 @@ cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
     while(ret >= 0) {
       ret = $id:(getId loopStep) (buf);
       ++pkts;
-      if (pkts % 1000000 == 0) {
-        fprintf(stderr, "Checkpoint! %d\n", pkts);
-      }
     }
  
     fprintf(stderr, "Cleaning up.\n");
