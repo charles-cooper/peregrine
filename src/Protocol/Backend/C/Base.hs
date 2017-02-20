@@ -14,7 +14,7 @@ import           Protocol
 import           Development.Shake
 
 import           Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
-import           Text.InterpolatedString.Perl6 (qc)
+import           Text.InterpolatedString.Perl6
 
 import           Data.Bits
 
@@ -22,6 +22,9 @@ import           Utils
 import           Data.Monoid
 
 import           Control.Monad
+
+import           System.IO.Unsafe (unsafePerformIO)
+import           System.Process
 
 data Specification a = Specification
   { _proto      :: Proto a
@@ -182,11 +185,17 @@ cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
     logBase2 x = finiteBitSize x - 1 - countLeadingZeros x
 
 compile :: Bool -> C a -> String
-compile dbg code = s 80 $ ppr $ mkCompUnit code
+compile dbg code = clang_format . s 80 . ppr $ mkCompUnit code
   where
     s = if dbg
       then prettyPragma
       else pretty
+
+clang_format :: String -> String
+clang_format = unsafePerformIO . readProcess "clang-format"
+  [ "-assume-filename=cpp"
+  , "-style={BasedOnStyle: Google, BreakBeforeBraces: Linux, NamespaceIndentation: All}"
+  ]
  
 compileShake :: Bool -> String -> String -> C a -> Rules ()
 compileShake dbg buildDir oname code = do
