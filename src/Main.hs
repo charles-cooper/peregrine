@@ -1,4 +1,5 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE CPP #-}
@@ -6,6 +7,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeSynonymInstances #-}
@@ -19,8 +21,8 @@ import qualified Protocol.Backend.C.Base as CP
 import           Protocol.Tmx.TAQ as TAQ
 import           Protocol.Tmx.TAQ.C as TAQ
 
-import Protocol.Nasdaq.ITCH.Proto as ITCH
-import Protocol.Nasdaq.ITCH.Proto.C as ITCH
+import           Protocol.Nasdaq.ITCH.Proto as ITCH
+import           Protocol.Nasdaq.ITCH.Proto.C as ITCH
 
 import           Language.C.Quote.C
 import qualified Language.C.Syntax as C
@@ -46,8 +48,10 @@ import Data.Functor.Identity
 import Data.Fix
 
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma, Pretty(..))
-import Text.InterpolatedString.Perl6 (q, qc)
-import Data.Text as T (unpack)
+import           Text.InterpolatedString.Perl6 (q, qc)
+import           Data.String.Here.Interpolated
+import           Data.String
+import qualified Data.Text as T
 
 import Utils
 
@@ -264,7 +268,7 @@ infixl 5 *.
 (*.) :: Signal a -> Signal a -> Peregrine a
 (*.) = zipWithP Mul
 
-type GroupStruct = [(CU.GType, String)]
+type GroupStruct = [(CU.GType, Identifier)]
 
 -- Flag representing whether a variable is used outside of
 -- its own dependencies. If so it needs to get written to the
@@ -278,24 +282,36 @@ permanent = (== Permanent)
 temporary :: Storage -> Bool
 temporary = (== Temporary)
 
-type HandleCont a = Message a -> (Message a -> [C.Stm]) -> [C.Stm]
+type Fragment = String
+
+type HandleCont a = Message a -> (Message a -> Fragment) -> Fragment
 type Handler a = [HandleCont a]
 
 runHandleCont :: Ord a => [CompInfo a] -> Message a -> [C.Stm]
-runHandleCont ns msg = go ns
+runHandleCont ns msg = [cstms|$escstm:(go ns)|]
   where
     go ns = case ns of
       []   -> []
       n:ns -> let k = (handler n)
               in (k msg) (\_msg -> go ns)
 
+newtype Exp = Exp { getExp :: String }
+  deriving (Eq, Ord, Monoid)
+newtype Identifier = Identifier { getIdentifier :: String }
+  deriving (Eq, Ord, Monoid)
+
+instance Show Exp where show = getExp
+instance Show Identifier where show = getIdentifier
+instance IsString Exp where fromString = Exp
+instance IsString Identifier where fromString = Identifier
+
 data CompInfo p = CompInfo
-  { src       :: String          -- ^ The raw identifier
-  , ref       :: C.Exp           -- ^ The expression including context
-  , ctype     :: CU.GType        -- ^ The C Type
-  , deps      :: Dependencies p  -- ^ Set of messages which trigger an update
-  , tmp       :: Bool            -- ^ Does not need to be written to storage
-  , handler   :: HandleCont p    -- ^ Function to generate C code
+  { src          :: Identifier     -- ^ The raw identifier
+  , ref          :: Exp            -- ^ The expression including context
+  , ctype        :: CU.GType       -- ^ The C Type
+  , dependencies :: Dependencies p -- ^ Set of messages which trigger an update
+  , tmp          :: Bool           -- ^ Does not need to be written to storage
+  , handler      :: HandleCont p   -- ^ Function to generate C code
   }
 
 data CompState a = CompState
@@ -335,29 +351,32 @@ traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
 trace :: Show a => String -> a -> a
 trace s = traceWith $ ((s++": ")++) . show
 
-genLocalId :: String -> Context a -> PeregrineC b String
+genLocalId :: Identifier -> Context a -> PeregrineC b Identifier
 -- TODO: generate from a new state for every fence
-genLocalId default_ ctx = lift . lift $ CU.genId (cnm cid)
+genLocalId default_ ctx = lift . lift $ Identifier <$> CU.genId (cnm cid)
   where
-    cid = maybe default_ id (annotation ctx)
+    cid = maybe (getIdentifier default_) id (annotation ctx)
 
 appendTopsort :: CompInfo a -> PeregrineC a ()
 appendTopsort compInfo = do
   modify $ \st -> st { nodeOrder = (nodeOrder st) |> compInfo }
 
-withCtx :: C.Exp -> String -> C.Exp
-withCtx ctx x = [cexp|$ctx -> $id:x|]
+withCtx :: Exp -> Identifier -> Exp
+withCtx ctx x = [i|${ctx}->${x}|]
 
-compileOp :: Op -> C.Exp -> C.Exp -> C.Exp
-compileOp Add x y = [cexp|$x + $y|]
-compileOp Sub x y = [cexp|$x - $y|]
-compileOp Mul x y = [cexp|$x * $y|]
-compileOp Div x y = [cexp|$x / $y|]
-compileOp Gt x y  = [cexp|$x > $y|]
-compileOp Ge x y  = [cexp|$x >= $y|]
-compileOp Lt x y  = [cexp|$x < $y|]
-compileOp Le x y  = [cexp|$x <= $y|]
-compileOp Eq x y  = [cexp|$x == $y|]
+compileOp :: Op -> Exp -> Exp -> Exp
+compileOp op x y = parens $ case op of
+  Add -> [i|${x} + ${y}|]
+  Sub -> [i|${x} - ${y}|]
+  Mul -> [i|${x} * ${y}|]
+  Div -> [i|${x} / ${y}|]
+  Gt  -> [i|${x} > ${y}|]
+  Ge  -> [i|${x} >= ${y}|]
+  Lt  -> [i|${x} < ${y}|]
+  Le  -> [i|${x} <= ${y}|]
+  Eq  -> [i|${x} == ${y}|]
+  where
+    parens e = "(" <> e <> ")"
 
 topState :: String
 topState = "state"
@@ -371,8 +390,9 @@ groupInfo :: Constraints a
 groupInfo group = case group of
   []   -> do
     let
-      ref      = CU.idExp topState
-      compInfo = CompInfo topState ref errorty (Deps mempty mempty) False mempty
+      src      = Identifier topState
+      ref      = Exp topState
+      compInfo = CompInfo src ref errorty dempty False mempty
       set      = maybe (Just (compInfo, [])) Just
     modify (\t -> t { groups = Map.alter set group (groups t) })
     return compInfo
@@ -395,40 +415,43 @@ groupInfo group = case group of
       -- the type of the struct
       groupId <- lift . lift $ CU.genId "group_map"
       iterId  <- lift . lift $ CU.genId "group"
-      (CompInfo _ key kty deps _ _) <- compileAST g
+      g <- compileAST g
 
       let
+        key     = ref g
+        kty     = ctype g
+        deps    = dependencies g
         iter    = [cty|typename $id:("struct " ++ iterId)|]
         iterPtr = [cty|typename $id:("struct " ++ iterId ++ " *")|]
-        map_    = withCtx parent groupId
-        lhs     = withCtx parent iterId
+        map_    = withCtx parent (Identifier groupId)
+        lhs     = withCtx parent (Identifier iterId)
         h       = \msg next -> if msg `Set.member` (_deps deps)
-          then [cstms|
-            if (! $map_.count($key)) {
-              $ty:iter tmp;/*TODO sane initialization*/
-              $map_[$key] = tmp;
+          then [iTrim|
+            if (! ${map_}.count(${key})) {
+              ${iter} tmp;/*TODO sane initialization*/
+              ${map_}[${key}] = tmp;
             }
             //Set the pointer so future dereferences within this callback
             //will refer to the right thing
-            $lhs = &(($map_)[$key]);
-            $stms:(next msg)
+            ${lhs} = &((${map_})[${key}]);
+            ${next msg}
             |]
           else next msg
 
         ret = CompInfo
-          { src      = iterId
-          , ref      = withCtx parent iterId
-          , ctype    = errorty
-          , deps     = error "Can't access Group deps"
-          , tmp      = False
-          , handler  = h
+          { src          = (Identifier iterId)
+          , ref          = withCtx parent (Identifier iterId)
+          , ctype        = errorty
+          , dependencies = error "Can't access Group deps"
+          , tmp          = False
+          , handler      = h
           }
 
       mapTy <- lift . lift $ CL.cpp_unordered_map (CU.simplety kty) iter
 
       let
-        iterData = (CU.SimpleTy iterPtr, iterId)
-        mapData  = (CU.SimpleTy mapTy, groupId)
+        iterData = (CU.SimpleTy iterPtr, Identifier iterId)
+        mapData  = (CU.SimpleTy mapTy, Identifier groupId)
         set Nothing = error "Didn't find group in map.."
         set (Just (compInfo, elems)) = Just
           (compInfo, iterData : mapData : elems)
@@ -441,14 +464,16 @@ groupInfo group = case group of
       return ret
 
 compileConstant :: Constant -> CompInfo a
-compileConstant c = CompInfo src value ty (Deps Set.empty Set.empty) tmp mempty
+compileConstant c = CompInfo src value ty dempty tmp mempty
   where
     src         = error "No variable for constant"
     tmp         = True
-    (value, ty) = case c of
-      ConstInt    i -> ([cexp|$i|], CU.SimpleTy CU.int)
-      ConstDouble d -> ([cexp|$d|], CU.SimpleTy CU.double)
-      ConstBool   b -> (CU.boolExp b, CU.SimpleTy CU.bool)
+    (value, ty) = first Exp $ case c of
+      ConstInt    i -> (show i, CU.SimpleTy CU.int)
+      ConstDouble d -> (show d, CU.SimpleTy CU.double)
+      ConstBool   b -> (showB b, CU.SimpleTy CU.bool)
+      where
+        showB b = if b then "true" else "false"
 
 compileZipWith :: Constraints a
   => Bool
@@ -490,18 +515,11 @@ compileZipWith root (deps, ctx) op x y = do
 
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     if msg `Set.member` (_deps deps) && (not tmp)
-      then [cstms|
-        $out = $zipExp;
-        $stms:(next msg)
+      then [iTrim|
+        ${out} = ${zipExp};
+        ${next msg}
         |]
       else next msg
-
-showTy :: CU.GType -> String
-showTy (CU.ArrayTy {}) = error "ArrayTy unused"
-showTy (CU.SimpleTy t) = pretty 80 (ppr t)
-
-showExp :: C.Exp -> String
-showExp e = pretty 80 (ppr e)
 
 compileMerge :: Constraints a
   => Bool
@@ -526,13 +544,13 @@ compileMerge _ (deps, ctx) x y = do
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     -- if it's in both deps then it will default to the left
     if
-      | msg `Set.member` (_deps deps1) -> [cstms|
-        $out = $ref1;
-        $stms:(next msg)
+      | msg `Set.member` (_deps deps1) -> [iTrim|
+        ${out} = ${ref1};
+        ${next msg}
         |]
-      | msg `Set.member` (_deps deps2) -> [cstms|
-          $out = $ref2;
-          $stms:(next msg)
+      | msg `Set.member` (_deps deps2) -> [iTrim|
+          ${out} = ${ref2};
+          ${next msg}
           |]
       | otherwise -> next msg
 
@@ -556,9 +574,10 @@ compileProjection (deps, ctx) p = do
     out           = if permanent storage
       then withCtx group myId
       else cprojection
-    cprojection   = [cexp|msg.$id:(cnm $ _msgName pmsg).$id:fieldName|]
+    cprojection   = [i|msg.${msgName}.${fieldName}|]
     (field, pmsg) = resolveProjection p
-    fieldName     = cnm $ _name field
+    msgName       = Identifier . cnm $ _msgName pmsg
+    fieldName     = Identifier . cnm $ _name field
 
   ty <- lift . lift $ _mkTy spec field
 
@@ -566,9 +585,9 @@ compileProjection (deps, ctx) p = do
 
   return $ CompInfo myId out ty deps (temporary storage) $ \msg next ->
     if msg == pmsg && permanent storage
-      then [cstms|
-        $out = $cprojection;
-        $stms:(next msg)
+      then [iTrim|
+        ${out} = ${cprojection};
+        ${next msg}
         |]
       else next msg
 
@@ -593,10 +612,10 @@ compileGuard _ (deps, ctx) pred ast = do
 
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     if msg `Set.member` (_deps deps)
-      then [cstms|
-         if ($pred) {
-           $out = $ref;
-           $stms:(next msg)
+      then [iTrim|
+         if (${pred}) {
+           ${out} = ${ref};
+           ${next msg}
          }
        |]
       else next msg
@@ -616,13 +635,13 @@ compileLast _ (deps, ctx) src = do
 
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     if msg `Set.member` (_deps deps)
-      then [cstms|
+      then [iTrim|
 
           // Do whatever depends on the last value
-          $stms:(next msg)
+          ${next msg}
 
           // Finally, assign to storage
-          $out = $ref;
+          ${out} = ${ref};
         |]
       else next msg
 
@@ -643,15 +662,14 @@ compileFold _ (deps, ctx) op src = do
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     let exp msg = compileOp op out ref
     in if msg `Set.member` (_deps deps)
-        then [cstms|
-           $out = $(exp msg);
-           $stms:(next msg)
+        then [iTrim|
+           ${out} = ${exp msg};
+           ${next msg}
          |]
         else next msg
 
 type NodeID  = Int
 
-type S a b = State (Map (ASTF a (Context IGroup) NodeID) NodeID) b
 assignNodeIds :: Ord a
   => Signal a
   -> (NodeID, Nodes a (Context IGroup))
@@ -692,6 +710,20 @@ data Dependencies p = Deps
   { _deps :: Set (Message p)
   , _revdeps :: Set (Message p) -- perhaps a better name for this is scope
   }
+dempty :: Dependencies p
+dempty = Deps Set.empty Set.empty
+
+class CShow a where
+  showC :: a -> Fragment
+instance CShow C.Exp where
+  showC e = pretty 80 (ppr e)
+
+instance CShow CU.GType where
+  showC (CU.ArrayTy {}) = error "ArrayTy unused"
+  showC (CU.SimpleTy t) = showC t
+instance CShow C.Type where
+  showC t = pretty 80 (ppr t)
+
 
 type Nodes a ctx = IntMap (ASTF a ctx NodeID)
 
@@ -705,7 +737,6 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
     m !. k = case IMap.lookup k m of
       Nothing -> dempty
       Just t  -> t
-    dempty = Deps mempty mempty
     st = execState (go root) mempty
     depends nid cnid = do
       -- nid depends on cnid
@@ -958,10 +989,11 @@ msgHandler spec peregrine = do
 
   let
     (CompState nodeInfo struct nodes) = snd iast
+    mkCsdecl (ty, id) = CP.mkCsdecl (getIdentifier id) ty
 
   forM (reverse (Map.elems struct)) $ \(compInfo, elems) -> do
     -- TODO sort elems by C width
-    cstruct (src compInfo) $ uncurry (flip CP.mkCsdecl) <$> elems
+    cstruct (getIdentifier (src compInfo)) $ mkCsdecl `map` elems
 
   foo <- CU.genId "foo"
   topDecl [cdecl|$ty:topStateTy $id:foo;|]

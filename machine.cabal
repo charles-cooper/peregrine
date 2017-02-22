@@ -50,6 +50,7 @@ executable machine
                      , mainland-pretty
                      , interpolatedstring-perl6
                      , neat-interpolation
+                     , here
                      , string-conversions
                      , text
                      , srcloc
