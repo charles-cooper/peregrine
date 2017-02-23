@@ -89,8 +89,11 @@ instance Show (Projection a) where
     ++ field
     ++ "\""
 
-data Op = Add | Mul | Div | Sub | Gt | Ge | Lt | Le | Eq
-  deriving (Show, Eq, Ord)
+data BinOp = Add | Mul | Div | Sub | Gt | Ge | Lt | Le | Eq
+  deriving (Eq, Ord, Show)
+
+data UnaryOp = Math String | Negate
+  deriving (Eq, Ord, Show)
 
 type AssocList a b = [(a, b)]
 
@@ -126,12 +129,14 @@ data ASTF
   next
   -- | Zip two streams together.
   -- The output will be x `op` y for most recent values of x and y
-  = ZipWith ctx Op next next
+  = ZipWith ctx BinOp next next
   -- | Merge the dependency graphs for two streams.
   -- Any listeners will be updated on update of either argument.
   | MergeExp ctx next next
+  -- | Unary operation
+  | MapExp ctx UnaryOp next
   -- | Fold an operation over a stream
-  | FoldExp ctx Op next
+  | FoldExp ctx BinOp next
   -- | A field within message.
   -- Basically a raw signal which comes directly from the protocol
   | ProjectExp ctx (Projection proto)
@@ -155,7 +160,7 @@ type IGroup = [NodeID]
 data Context g = Context
   { nodeGroup  :: g
   , annotation :: Maybe String
-  } deriving (Show)
+  } deriving (Show, Functor, Foldable, Traversable)
 type IContext a = (Dependencies a, Context IGroup)
 
 -- Special Eq and Ord instances for Context
@@ -219,10 +224,10 @@ merge x y = signal $ \ctx -> Fix $ MergeExp ctx (x) (y)
 project :: Proto a -> String -> String -> Peregrine a
 project p x y = signal $ \ctx -> Fix $ ProjectExp ctx (Projection p x y)
 
-zipWithP :: Op -> Signal a -> Signal a -> Peregrine a
+zipWithP :: BinOp -> Signal a -> Signal a -> Peregrine a
 zipWithP op x y = signal $ \ctx -> Fix $ ZipWith ctx op (x) (y)
 
-foldP :: Op -> Signal a -> Peregrine a
+foldP :: BinOp -> Signal a -> Peregrine a
 foldP op x = signal $ \ctx -> Fix $ FoldExp ctx op (x)
 
 guardP :: Signal a -> Signal a -> Peregrine a
@@ -290,25 +295,31 @@ type Fragment = String
 type HandleCont a = Message a -> (Message a -> C Fragment) -> C Fragment
 type Handler a = [HandleCont a]
 
-runHandleCont :: Ord a => [CompInfo a] -> Message a -> C [C.Stm]
-runHandleCont ns msg = do
-  stm <- go ns
-  return [cstms|$escstm:(stm)|]
+runHandleCont :: Ord a => [HandleCont a] -> Message a -> C [C.Stm]
+runHandleCont ks msg = do
+  code <- go ks
+  return [cstms|$escstm:(code)|]
   where
-    go ns = case ns of
+    go ks = case ks of
       []   -> return []
-      n:ns -> let k = (handler n)
-              in (k msg) (\_msg -> go ns)
+      k:ks -> (k msg) (\_msg -> go ks)
 
 newtype Exp = Exp { getExp :: String }
   deriving (Eq, Ord, Monoid)
 newtype Identifier = Identifier { getIdentifier :: String }
   deriving (Eq, Ord, Monoid)
+newtype Type = Type { getType :: String }
+  deriving (Eq, Ord)
 
 instance Show Exp where show = getExp
 instance Show Identifier where show = getIdentifier
+instance Show Type where show = getType
 instance IsString Exp where fromString = Exp
 instance IsString Identifier where fromString = Identifier
+instance IsString Type where fromString = Type
+
+type_ :: C.Type -> Type
+type_ = Type . pretty 80 . ppr
 
 data CompInfo p = CompInfo
   { src          :: Identifier     -- ^ The raw identifier
@@ -326,7 +337,7 @@ data CompState a = CompState
   -- ^ The compilation info for each node
   , groups    :: Map IGroup (CompInfo a, GroupStruct)
   -- ^ Map from groups to structs
-  , nodeOrder :: Seq (CompInfo a)
+  , nodeOrder :: Seq (HandleCont a)
   -- ^ An ordered visiting of the nodes
   --   Include the Node so we can lookup its revdeps
   --   A nice refactor would just be a (Seq NodeID) ..
@@ -362,14 +373,14 @@ genLocalId default_ ctx = lift . lift $ Identifier <$> CU.genId (cnm cid)
   where
     cid = maybe (getIdentifier default_) id (annotation ctx)
 
-appendTopsort :: CompInfo a -> PeregrineC a ()
-appendTopsort compInfo = do
-  modify $ \st -> st { nodeOrder = (nodeOrder st) |> compInfo }
+appendTopsort :: HandleCont a -> PeregrineC a ()
+appendTopsort handler = do
+  modify $ \st -> st { nodeOrder = (nodeOrder st) |> handler }
 
 withCtx :: Exp -> Identifier -> Exp
 withCtx ctx x = [i|${ctx}->${x}|]
 
-compileOp :: Op -> Exp -> Exp -> Exp
+compileOp :: BinOp -> Exp -> Exp -> Exp
 compileOp op x y = parens $ case op of
   Add -> [i|${x} + ${y}|]
   Sub -> [i|${x} - ${y}|]
@@ -400,6 +411,7 @@ groupInfo group = case group of
       compInfo = CompInfo src ref errorty dempty False (flip ($))
       set      = maybe (Just (compInfo, [])) Just
     modify (\t -> t { groups = Map.alter set group (groups t) })
+    appendTopsort (handler compInfo)
     return compInfo
 
   g:gs -> do
@@ -409,7 +421,7 @@ groupInfo group = case group of
       Just (t, _) -> return t
       Nothing -> do
         compInfo <- genGroupInfo g gs
-        appendTopsort compInfo
+        appendTopsort (handler compInfo)
         return compInfo
 
   where
@@ -433,7 +445,7 @@ groupInfo group = case group of
         h       = \msg next -> if msg `Set.member` (_deps deps)
           then next msg >>= \next -> return [iTrim|
             if (! ${map_}.count(${key})) {
-              ${iter} tmp;/*TODO sane initialization*/
+              ${type_ iter} tmp;/*TODO sane initialization*/
               ${map_}[${key}] = tmp;
             }
             //Set the pointer so future dereferences within this callback
@@ -483,7 +495,7 @@ compileConstant c = CompInfo src value ty dempty tmp (flip ($))
 compileZipWith :: Constraints a
   => Bool
   -> IContext a
-  -> Op
+  -> BinOp
   -> CompInfo a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
@@ -499,7 +511,7 @@ compileZipWith _ (deps, ctx) op x y = do
     storage    = storageRequirement deps
     tmp        = temporary storage
     out        = if tmp
-      then [i|${Identifier (showC ty)}(${zipExp})|]
+      then [i|${type_ (CU.simplety ty)}(${zipExp})|]
       -- ^ ugly cast. Using SSA (const temp variables)
       --   will result in clearer code
       else withCtx group myId
@@ -646,10 +658,8 @@ compileLast _ (deps, ctx) src = do
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     if msg `Set.member` (_deps deps)
       then next msg >>= \next -> return [iTrim|
-
           // Do whatever depends on the last value
           ${next}
-
           // Finally, assign to storage
           ${out} = ${ref};
         |]
@@ -658,7 +668,7 @@ compileLast _ (deps, ctx) src = do
 compileFold :: Constraints a
   => Bool
   -> IContext a
-  -> Op
+  -> BinOp
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
 compileFold _ (deps, ctx) op src = do
@@ -668,15 +678,17 @@ compileFold _ (deps, ctx) op src = do
   let
     out = withCtx group myId
     tmp = False
+    comment = maybe "" ("// update "++) (annotation ctx)
 
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     let exp msg = compileOp op out ref
     in if msg `Set.member` (_deps deps)
-        then next msg >>= \next -> return [iTrim|
+         then next msg >>= \next -> return [iTrim|
+           ${comment}
            ${out} = ${exp msg};
            ${next}
-         |]
-        else next msg
+           |]
+         else next msg
 
 compileObserve :: Constraints a
   => Bool
@@ -730,7 +742,7 @@ assignNodeIds ast = (,) root (IMap.fromList . map swap . Map.toList $ st)
     go (Fix ast) = do
       -- assign node ids for all the group signals
       ast <- mapM go ast
-      ast <- mapMCtx runGroup ast
+      ast <- mapCtxM runGroup ast
       st  <- get
       case Map.lookup ast st of
         Just nid -> return nid
@@ -740,10 +752,10 @@ assignNodeIds ast = (,) root (IMap.fromList . map swap . Map.toList $ st)
           return nid
 
 mapCtx :: (ctx -> ctx') -> ASTF a ctx b -> (ASTF a ctx' b)
-mapCtx f = runIdentity . mapMCtx (return . f)
+mapCtx f = runIdentity . mapCtxM (return . f)
 
-mapMCtx :: Monad m => (ctx -> m ctx') -> ASTF a ctx b -> m (ASTF a ctx' b)
-mapMCtx f ast = case ast of
+mapCtxM :: Monad m => (ctx -> m ctx') -> ASTF a ctx b -> m (ASTF a ctx' b)
+mapCtxM f ast = case ast of
   ZipWith ctx op x y  -> run ctx $ \ctx -> ZipWith ctx op x y
   MergeExp ctx x y    -> run ctx $ \ctx -> MergeExp ctx x y
   FoldExp ctx op x    -> run ctx $ \ctx -> FoldExp ctx op x
@@ -762,25 +774,13 @@ data Dependencies p = Deps
 dempty :: Dependencies p
 dempty = Deps Set.empty Set.empty
 
-class CShow a where
-  showC :: a -> Fragment
-instance CShow C.Exp where
-  showC e = pretty 80 (ppr e)
-
-instance CShow CU.GType where
-  showC (CU.ArrayTy {}) = error "ArrayTy unused"
-  showC (CU.SimpleTy t) = showC t
-instance CShow C.Type where
-  showC t = pretty 80 (ppr t)
-
-
 type Nodes a ctx = IntMap (ASTF a ctx NodeID)
 
 -- calculate dependencies
 calcDeps :: Constraints a
   => NodeID
-  -> Nodes a ctx
-  -> Nodes a (Dependencies a, ctx)
+  -> Nodes a (Context IGroup)
+  -> Nodes a (IContext a)
 calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
   where
     m !. k = case IMap.lookup k m of
@@ -800,7 +800,7 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       modify $ IMap.adjust
         (\c -> c { _revdeps = _revdeps c <> _deps deps }) cnid
 
-    go nid = case nodes ! nid of
+    go nid = mapCtxM (mapM go . nodeGroup) ast >> case ast of
       ZipWith _ _ x y -> do
         nid `depends` x
         nid `depends` y
@@ -813,12 +813,14 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
         let (_field, pmsg) = resolveProjection p
         modify $ IMap.insert nid (Deps (Set.singleton pmsg) mempty)
       GuardExp _ _pred x -> do
-        nid `depends` x -- does `nid` reverse depend on pred .. ?
+        nid `depends` x -- TODO does `nid` reverse depend on pred .. ?
       LastExp _ x -> do
         nid `depends` x
       ObserveExp _ x -> do
         nid `depends` x
       ConstExp {} -> return ()
+      where
+        ast = nodes ! nid
 
 compileAST :: Constraints a
   => NodeID
@@ -869,7 +871,7 @@ compileAST root = go root -- could this use hyloM?
         Nothing       -> do
           compInfo <- action
 
-          appendTopsort compInfo
+          appendTopsort (handler compInfo)
 
           -- mark seen
           modify $ \st -> st
@@ -1008,7 +1010,7 @@ simpleProgram group = do
   groupBy symbol $ do
     bid  <- taqBidPrice
     lbid <- lastP bid                       @! "lastbid"
-    sum  <- sumP lbid                       @! "sumbid"
+    sum  <- sumP lbid                       -- @! "sumbid"
     pred <- sum >. 0                        @! "pred"
     twice_sum <- sum +. sum                 @! "twice sum"
     x <- guardP pred sum                    @! "guarded sum"
@@ -1134,7 +1136,8 @@ opts = CP.CompileOptions
 
 main = CP.compile (CompileOptions True 0 Clang "peregrine") "bin" . p2c $ do
   s <- symbolP
-  groupBy s $ do
-    ret <- join $ covariance <$> taqBidPrice <*> taqAskPrice
-    observe ret
+  simpleProgram s
+  -- groupBy s $ sumP =<< taqBidPrice
+    -- ret <- join $ covariance <$> taqBidPrice <*> taqAskPrice
+    -- observe ret
 

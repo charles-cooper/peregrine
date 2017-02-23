@@ -25,6 +25,8 @@ import           Control.Monad
 
 import           System.IO.Unsafe (unsafePerformIO)
 import           System.Process
+import           System.IO
+import           Data.Time.Clock
 
 data Specification a = Specification
   { _proto      :: Proto a
@@ -201,11 +203,19 @@ type Debug = Bool
 
 data CCompiler = GCC | Clang
 
+timer :: String -> IO a -> IO a
+timer msg action = do
+  t0 <- getCurrentTime
+  ret <- action
+  t1 <- getCurrentTime
+  hPutStrLn stderr $ msg ++ " took " ++ show (t1 `diffUTCTime` t0)
+  return ret
+
 compile :: CompileOptions -> FilePath -> C a -> IO ()
 compile (CompileOptions dbg optLevel compiler oname) buildDir code = do
-  writeFile src (codeGen False code)
-  putStrLn $ "## " ++ cmd
-  callCommand cmd
+  timer "codegen" $ writeFile src (codeGen False code)
+  hPutStrLn stderr $ "## " ++ cmd
+  timer "compile" $ callCommand cmd
   where
     cmd = [qc|{cc} -std=c++11 -march=native -O{optLevel} {dbgFlag} -o {out} {src}|]
     cc  = compilerCmd compiler

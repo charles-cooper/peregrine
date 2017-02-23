@@ -48,5 +48,6 @@ executable machine
                      , lens
 
                      , process
+                     , time
                      , directory
                      , shake
