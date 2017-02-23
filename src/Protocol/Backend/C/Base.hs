@@ -24,9 +24,8 @@ import           Data.Monoid
 import           Control.Monad
 
 import           System.IO.Unsafe (unsafePerformIO)
-import           System.Process
 import           System.IO
-import           Data.Time.Clock
+import           System.Process
 
 data Specification a = Specification
   { _proto      :: Proto a
@@ -160,6 +159,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
 cmain :: Specification a -> MsgHandler a -> C C.Func
 cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
   include "cstdio"
+  include "cmath" -- lazy, just assume the code might use it
   loopStep     <- mainLoop spec handler
   initMsgs     <- _initMsg `mapM` _outgoingMessages _proto
   cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages _proto
@@ -202,14 +202,6 @@ clang_format = unsafePerformIO . readProcess "clang-format"
 type Debug = Bool
 
 data CCompiler = GCC | Clang
-
-timer :: String -> IO a -> IO a
-timer msg action = do
-  t0 <- getCurrentTime
-  ret <- action
-  t1 <- getCurrentTime
-  hPutStrLn stderr $ msg ++ " took " ++ show (t1 `diffUTCTime` t0)
-  return ret
 
 compile :: CompileOptions -> FilePath -> C a -> IO ()
 compile (CompileOptions dbg optLevel compiler oname) buildDir code = do

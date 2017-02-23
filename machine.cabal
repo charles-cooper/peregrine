@@ -18,6 +18,8 @@ executable machine
   ghc-options:
     -fwarn-incomplete-patterns
     -fwarn-missing-fields
+    -threaded
+    --with-rtsopts="-N"
   default-language:    Haskell2010
   other-modules:       Language.C.Utils
                      , Language.C.Lib
@@ -51,3 +53,4 @@ executable machine
                      , time
                      , directory
                      , shake
+                     , async

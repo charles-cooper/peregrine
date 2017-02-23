@@ -36,8 +36,15 @@ import           Language.C.Utils (topDecl, require)
 import           Language.C.Utils (char, bool, ushort, uint, ulong)
 import qualified Language.C.Lib as CL
 
+-- Actually running the compiled program
+import           Control.Concurrent
+import           Control.Concurrent.Async
+import           Control.Exception
+import           System.Directory
+import           System.Process
+
 import Data.Monoid
-import Data.List (intercalate)
+import Data.List (intercalate, tails)
 import Data.Maybe
 import Data.Tuple (swap)
 import Control.Arrow
@@ -92,7 +99,8 @@ instance Show (Projection a) where
 data BinOp = Add | Mul | Div | Sub | Gt | Ge | Lt | Le | Eq
   deriving (Eq, Ord, Show)
 
-data UnaryOp = Math String | Negate
+data UnaryOp
+  = Math String -- function name from cmath e.g. "abs"
   deriving (Eq, Ord, Show)
 
 type AssocList a b = [(a, b)]
@@ -118,6 +126,9 @@ data Constant
   | ConstDouble Double
   | ConstBool Bool
   deriving (Show, Eq, Ord)
+
+data Observation = Every | Summary
+  deriving (Eq, Ord, Show)
 
 data ASTF
   -- | The protocol
@@ -145,7 +156,7 @@ data ASTF
   -- | One before current
   | LastExp ctx next
   -- | Observe an expression
-  | ObserveExp ctx next
+  | ObserveExp ctx Observation next
   -- | A constant
   | ConstExp Constant
   deriving (Show, Eq, Ord, Functor, Foldable, Traversable)
@@ -154,6 +165,9 @@ type Signal a = Fix (ASTF a (Context (Group a)))
 
 newtype Group a = Group { getGroup :: [Signal a] }
   deriving (Eq, Ord)
+
+type NodeID  = Int
+type Nodes a ctx = IntMap (ASTF a ctx NodeID)
 type IGroup = [NodeID]
 
 -- front-end peregrine context
@@ -230,14 +244,21 @@ zipWithP op x y = signal $ \ctx -> Fix $ ZipWith ctx op (x) (y)
 foldP :: BinOp -> Signal a -> Peregrine a
 foldP op x = signal $ \ctx -> Fix $ FoldExp ctx op (x)
 
+mapP :: UnaryOp -> Signal a -> Peregrine a
+mapP f x = signal $ \ctx -> Fix $ MapExp ctx f x
+
 guardP :: Signal a -> Signal a -> Peregrine a
 guardP pred x = signal $ \ctx -> Fix $ GuardExp ctx (pred) (x)
 
 lastP :: Signal a -> Peregrine a
 lastP x = signal $ \ctx -> Fix $ LastExp ctx (x)
 
+-- TODO change the group, `observe x` should have same group as `x`
 observe :: Signal a -> Peregrine a
-observe x = signal $ \ctx -> Fix $ ObserveExp ctx x
+observe x = signal $ \ctx -> Fix $ ObserveExp ctx Every x
+
+summary :: Signal a -> Peregrine a
+summary x = signal $ \ctx -> Fix $ ObserveExp ctx Summary x
 
 infixl 8 ==.
 infixl 7 <.
@@ -327,6 +348,7 @@ data CompInfo p = CompInfo
   , ctype        :: CU.GType       -- ^ The C Type
   , dependencies :: Dependencies p -- ^ Set of messages which trigger an update
   , tmp          :: Bool           -- ^ Does not need to be written to storage
+  , cleanup      :: HandleCont p   -- ^ What to do at the end
   , handler      :: HandleCont p   -- ^ Function to generate C code
   }
 
@@ -335,9 +357,9 @@ data CompState a = CompState
   -- we can hash or compress representation of the nodes
   { nodeInfo  :: IntMap (CompInfo a)
   -- ^ The compilation info for each node
-  , groups    :: Map IGroup (CompInfo a, GroupStruct)
+  , groups    :: Map IGroup (Identifier, CompInfo a, GroupStruct)
   -- ^ Map from groups to structs
-  , nodeOrder :: Seq (HandleCont a)
+  , nodeOrder :: Seq (CompInfo a)
   -- ^ An ordered visiting of the nodes
   --   Include the Node so we can lookup its revdeps
   --   A nice refactor would just be a (Seq NodeID) ..
@@ -373,9 +395,9 @@ genLocalId default_ ctx = lift . lift $ Identifier <$> CU.genId (cnm cid)
   where
     cid = maybe (getIdentifier default_) id (annotation ctx)
 
-appendTopsort :: HandleCont a -> PeregrineC a ()
-appendTopsort handler = do
-  modify $ \st -> st { nodeOrder = (nodeOrder st) |> handler }
+appendTopsort :: CompInfo a -> PeregrineC a ()
+appendTopsort node = do
+  modify $ \st -> st { nodeOrder = (nodeOrder st) |> node }
 
 withCtx :: Exp -> Identifier -> Exp
 withCtx ctx x = [i|${ctx}->${x}|]
@@ -394,41 +416,44 @@ compileOp op x y = parens $ case op of
   where
     parens e = "(" <> e <> ")"
 
-topState :: String
+topState :: String -- Identifier
 topState = "state"
 
-topStateTy :: C.Type
+topStateTy :: C.Type -- Type
 topStateTy = [cty|typename $id:("struct " ++ topState)|]
+
+hempty :: HandleCont p
+hempty = flip ($)
 
 groupInfo :: Constraints a
   => IGroup
-  -> PeregrineC a (CompInfo a)
+  -> PeregrineC a (Identifier, CompInfo a)
 groupInfo group = case group of
   []   -> do
     let
       src      = Identifier topState
       ref      = Exp topState
-      compInfo = CompInfo src ref errorty dempty False (flip ($))
-      set      = maybe (Just (compInfo, [])) Just
+      compInfo = CompInfo src ref errorty dempty False hempty hempty
+      set      = maybe (Just (src, compInfo, [])) Just
     modify (\t -> t { groups = Map.alter set group (groups t) })
-    appendTopsort (handler compInfo)
-    return compInfo
+    appendTopsort compInfo
+    return (src, compInfo)
 
   g:gs -> do
     st <- groups <$> get
     case Map.lookup group st of
       -- we've already compiled the group
-      Just (t, _) -> return t
+      Just (i, t, _) -> return (i, t)
       Nothing -> do
-        compInfo <- genGroupInfo g gs
-        appendTopsort (handler compInfo)
-        return compInfo
+        (mapName, compInfo) <- genGroupInfo g gs
+        appendTopsort compInfo
+        return (Identifier mapName, compInfo)
 
   where
     errorty = error "Can't propagate type of group!"
 
     genGroupInfo g gs = do
-      (CompInfo _ parent _ deps _ _) <- groupInfo gs
+      parent <- ref . snd <$> groupInfo gs
       -- the type of the struct
       groupId <- lift . lift $ CU.genId "group_map"
       iterId  <- lift . lift $ CU.genId "group"
@@ -462,6 +487,7 @@ groupInfo group = case group of
           , dependencies = error "Can't access Group deps"
           , tmp          = False
           , handler      = h
+          , cleanup      = hempty
           }
 
       mapTy <- lift . lift $ CL.cpp_unordered_map (CU.simplety kty) iter
@@ -470,18 +496,19 @@ groupInfo group = case group of
         iterData = (CU.SimpleTy iterPtr, Identifier iterId)
         mapData  = (CU.SimpleTy mapTy, Identifier groupId)
         set Nothing = error "Didn't find group in map.."
-        set (Just (compInfo, elems)) = Just
-          (compInfo, iterData : mapData : elems)
+        set (Just (i, compInfo, elems)) = Just
+          (i, compInfo, iterData : mapData : elems)
 
       -- Insert self into global list of structs
-      modify (\t -> t { groups = Map.insert group (ret, []) (groups t) })
+      modify (\t -> t
+        { groups = Map.insert group (Identifier groupId, ret, []) (groups t) })
       -- Insert self into parent struct
       modify (\t -> t { groups = Map.alter set gs (groups t) })
 
-      return ret
+      return (groupId, ret)
 
 compileConstant :: Constant -> CompInfo a
-compileConstant c = CompInfo src value ty dempty tmp (flip ($))
+compileConstant c = CompInfo src value ty dempty tmp hempty hempty
   where
     src         = error "No variable for constant"
     tmp         = True
@@ -493,21 +520,19 @@ compileConstant c = CompInfo src value ty dempty tmp (flip ($))
         showB b = if b then "true" else "false"
 
 compileZipWith :: Constraints a
-  => Bool
-  -> IContext a
+  => IContext a
   -> BinOp
   -> CompInfo a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileZipWith _ (deps, ctx) op x y = do
+compileZipWith (deps, ctx) op x y = do
 
-  myId <- genLocalId "zip" ctx
-  (CompInfo _ group _ _ _ _)  <- groupInfo (nodeGroup ctx)
-  (CompInfo _ ref1 ty1 _ _ _) <- pure x
-  (CompInfo _ ref2 ty2 _ _ _) <- pure y
+  myId  <- genLocalId "zip" ctx
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
 
   let
-    zipExp     = compileOp op ref1 ref2
+    ann        = maybe "" (\x -> "/*"++x++"*/") (annotation ctx)
+    zipExp     = fromString ann <> compileOp op (ref x) (ref y)
     storage    = storageRequirement deps
     tmp        = temporary storage
     out        = if tmp
@@ -515,11 +540,11 @@ compileZipWith _ (deps, ctx) op x y = do
       -- ^ ugly cast. Using SSA (const temp variables)
       --   will result in clearer code
       else withCtx group myId
-    sty1       = CU.simplety ty1
-    sty2       = CU.simplety ty2
+    sty1       = CU.simplety (ctype x)
+    sty2       = CU.simplety (ctype y)
     ty         = if
-      | ty1 == ty2
-        -> ty1
+      | (ctype x) == (ctype y)
+        -> (ctype x)
       | not (CU.isNumeric sty1) || not (CU.isNumeric sty2)
         -> error $ "Can't zip types " <> show sty1 <> ", " <> show sty2
       | op == Div || CU.double `elem` [sty1, sty2]
@@ -528,13 +553,13 @@ compileZipWith _ (deps, ctx) op x y = do
         -> CU.SimpleTy . CU.signedOf $
           if CU.width sty1 >= CU.width sty2 then sty1 else sty2
       | op `elem` [Add, Mul, Sub] -- neither is signed
-        -> if CU.width sty1 >= CU.width sty2 then ty1 else ty2
+        -> CU.SimpleTy (if CU.width sty1 >= CU.width sty2 then sty1 else sty2)
       | op `elem` [Gt, Ge, Lt, Le, Eq]
         -> CU.SimpleTy CU.bool
       | otherwise
         -> error $ "Can't zip numeric types??" <> show sty1 <> ", " <> show sty2
 
-  return $ CompInfo myId out ty deps tmp $ \msg next ->
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps) && (not tmp)
       then next msg >>= \next -> return [iTrim|
         ${out} = ${zipExp};
@@ -542,60 +567,86 @@ compileZipWith _ (deps, ctx) op x y = do
         |]
       else next msg
 
+compileMap :: Constraints a
+  => IContext a
+  -> UnaryOp
+  -> CompInfo a
+  -> PeregrineC a (CompInfo a)
+compileMap (deps, ctx) op x = do
+
+  myId  <- genLocalId "fmap" ctx
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
+
+  let
+    ty      = CU.SimpleTy CU.double -- TODO revisit
+    storage = storageRequirement deps
+    tmp     = temporary storage
+    mapExp  = case op of
+      Math f -> [i|${Identifier f}(${ref x})|]
+    out     = if tmp
+      then mapExp
+      else withCtx group myId
+
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
+    if msg `Set.member` (_deps deps) && (not tmp)
+      then next msg >>= \next -> return [iTrim|
+        ${out} = ${mapExp};
+        ${next}
+        |]
+      else next msg
+
 compileMerge :: Constraints a
-  => Bool
-  -> IContext a
+  => IContext a
   -> CompInfo a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileMerge _ (deps, ctx) x y = do
+compileMerge (deps, ctx) x y = do
 
   myId <- genLocalId "merge" ctx
-  (CompInfo _ group _ _ _ _)      <- groupInfo (nodeGroup ctx)
-  (CompInfo _ ref1 ty1 deps1 _ _) <- pure x
-  (CompInfo _ ref2 ty2 deps2 _ _) <- pure y
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
 
   let
     out        = withCtx group myId
-    ty         = if ty1 == ty2
-      then ty1
+    ty         = if ctype x == ctype y
+      then ctype x
       else error $ "Tried to merge two unequal types, I don't know what to do"
     tmp        = False -- TODO revisit
 
-  return $ CompInfo myId out ty deps tmp $ \msg next -> do
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next -> do
     next <- next msg
     -- if it's in both deps then it will default to the left
     return $ if
-      | msg `Set.member` (_deps deps1) -> [iTrim|
-        ${out} = ${ref1};
+      | msg `Set.member` (_deps (dependencies x)) -> [iTrim|
+        ${out} = ${ref x};
         ${next}
         |]
-      | msg `Set.member` (_deps deps2) -> [iTrim|
-          ${out} = ${ref2};
+      | msg `Set.member` (_deps (dependencies y)) -> [iTrim|
+          ${out} = ${ref y};
           ${next}
           |]
       | otherwise -> next
 
 storageRequirement :: Ord a => Dependencies a -> Storage
-storageRequirement (Deps deps revdeps) = if revdeps `Set.isSubsetOf` deps
-  then Temporary
-  else Permanent
+storageRequirement (Deps deps revdeps mustStore) = if
+  | mustStore                     -> Permanent
+  | revdeps `Set.isSubsetOf` deps -> Temporary
+  | otherwise                     -> Permanent
 
 compileProjection :: Constraints a
   => IContext a
   -> Projection a
   -> PeregrineC a (CompInfo a)
 compileProjection (deps, ctx) p = do
+  myId  <- genLocalId "projection" ctx
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
+  spec  <- specification <$> ask
 
-  myId <- genLocalId "projection" ctx
-  (CompInfo _ group _ _ _ _) <- groupInfo (nodeGroup ctx)
-
-  spec <- specification <$> ask
   let
     storage       = storageRequirement deps
-    out           = if permanent storage
-      then withCtx group myId
-      else cprojection
+    tmp           = temporary storage
+    out           = if tmp
+      then cprojection
+      else withCtx group myId
     cprojection   = [i|msg.${msgName}.${fieldName}|]
     (field, pmsg) = resolveProjection p
     msgName       = Identifier . cnm $ _msgName pmsg
@@ -603,9 +654,7 @@ compileProjection (deps, ctx) p = do
 
   ty <- lift . lift $ _mkTy spec field
 
-  tmp <- lift . lift $ CU.genId "tmp" -- we don't really need this every time
-
-  return $ CompInfo myId out ty deps (temporary storage) $ \msg next ->
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg == pmsg && permanent storage
       then next msg >>= \next -> return [iTrim|
         ${out} = ${cprojection};
@@ -617,22 +666,21 @@ compileProjection (deps, ctx) p = do
 -- Can something from a guard escape its guard scope? (probably should be able to)
 -- How does it interact with dependencies?
 compileGuard :: Constraints a
-  => Bool
-  -> IContext a
+  => IContext a
   -> CompInfo a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileGuard _ (deps, ctx) pred ast = do
+compileGuard (deps, ctx) pred ast = do
   myId <- genLocalId "guard" ctx
-  (CompInfo _ group _ _ _ _)  <- groupInfo (nodeGroup ctx)
-  -- TODO add check that pred is type bool
-  (CompInfo _ pred _ _ _ _)  <- pure pred
-  (CompInfo _ ref ty _ _ _)  <- pure ast
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
+  pred  <- pure (ref pred) -- TODO add check that pred is type bool
+  ref   <- pure (ref ast)
+  ty    <- pure (ctype ast)
   let
     out = withCtx group myId
     tmp = False -- TODO can do better?
 
-  return $ CompInfo myId out ty deps tmp $ \msg next ->
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps)
       then next msg >>= \next -> return [iTrim|
          if (${pred}) {
@@ -643,19 +691,19 @@ compileGuard _ (deps, ctx) pred ast = do
       else next msg
 
 compileLast :: Constraints a
-  => Bool
-  -> IContext a
+  => IContext a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileLast _ (deps, ctx) src = do
-  myId <- genLocalId "last" ctx
-  (CompInfo _ group _ _ _ _) <- groupInfo (nodeGroup ctx)
-  (CompInfo _ ref ty _ _ _)  <- pure src
+compileLast (deps, ctx) src = do
+  myId  <- genLocalId "last" ctx
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
+  ref   <- pure (ref src)
+  ty    <- pure (ctype src)
   let
     out = withCtx group myId
     tmp = False
 
-  return $ CompInfo myId out ty deps tmp $ \msg next ->
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps)
       then next msg >>= \next -> return [iTrim|
           // Do whatever depends on the last value
@@ -666,21 +714,21 @@ compileLast _ (deps, ctx) src = do
       else next msg
 
 compileFold :: Constraints a
-  => Bool
-  -> IContext a
+  => IContext a
   -> BinOp
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileFold _ (deps, ctx) op src = do
+compileFold (deps, ctx) op src = do
   myId <- genLocalId "fold" ctx
-  (CompInfo _ group _ _ _ _) <- groupInfo (nodeGroup ctx)
-  (CompInfo _ ref ty _ _ _)  <- pure src
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
+  ref <- pure (ref src)
+  ty  <- pure (ctype src)
   let
     out = withCtx group myId
     tmp = False
     comment = maybe "" ("// update "++) (annotation ctx)
 
-  return $ CompInfo myId out ty deps tmp $ \msg next ->
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     let exp msg = compileOp op out ref
     in if msg `Set.member` (_deps deps)
          then next msg >>= \next -> return [iTrim|
@@ -691,12 +739,17 @@ compileFold _ (deps, ctx) op src = do
          else next msg
 
 compileObserve :: Constraints a
-  => Bool
-  -> IContext a
+  => IContext a
+  -> Observation
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileObserve _ (deps, ctx) x = do
-  (CompInfo _ group _ _ _ _) <- groupInfo (nodeGroup ctx)
+compileObserve (deps, ctx) observeType x = do
+  group     <- ref . snd <$> groupInfo (nodeGroup ctx)
+  nodes     <- nodeContext <$> ask
+  spec      <- specification <$> ask
+  groupKeys <- mapM compileAST (nodeGroup ctx)
+  groups    <- mapM groupInfo (tails (nodeGroup ctx))
+
   let
     tmp = True
     fmt :: CU.GType -> Exp -> C (Exp, Exp)
@@ -710,25 +763,52 @@ compileObserve _ (deps, ctx) x = do
         | CU.signed ty    -> ("%d", e)
         | otherwise       -> ("%u", e)
     fmt (CU.ArrayTy {}) _ = error "TODO format array ty"
+    toPrint = map (ctype &&& ref) $ reverse $ x : groupKeys
+    commas  = Exp . intercalate "," . map getExp
+    handler = case observeType of
+      Every   -> \msg next -> if msg `Set.member` (_deps deps)
+          then do
+            next <- next msg
+            (fmts, exps) <- unzip <$> mapM (uncurry fmt) toPrint
+            return [iTrim|
+              printf("${commas fmts}\\n", ${commas exps});
+              ${next}
+              |]
+          else next msg
+      Summary -> hempty
+    cleanup = case observeType of
+      Summary -> \msg next -> runOnce msg (next msg) $ do
+        (fmts, exps) <- unzip <$> mapM (uncurry fmt) toPrint
+        next <- next msg
+        let gs = reverse $ zip (x : groupKeys) groups
+        return $ forLoop fmts exps gs ++ next
+      Every   -> hempty
+      where
+        -- only generate code for one message (or once if there are no messages)
+        runOnce msg done code = if maybe True (msg ==) (maybeHead msgs)
+          then code
+          else done
+        msgs = _outgoingMessages (_proto spec)
+        forLoop fmts exps gs = go gs
+          where
+            gid gs = Exp $ intercalate "->" $ getIdentifier . fst . snd <$> gs
+            go []     = error "Programmer error: Recursed too far"
+            go [x]    = [i|printf("${commas fmts}\\n", ${commas exps});|]
+            go (g:gs) = let
+              kref = ref (fst g)       -- state->key
+              g'   = case maybeHead gs of
+                Nothing -> error "Invariant violated: list < len 1"
+                Just g  -> g
+              gref = ref (snd (snd g')) -- state->group
+              in [iTrim|for (auto it = ${gid (g:gs)}.begin(); it != ${gid (g:gs)}.end(); ++it)
+                {
+                  ${kref} = it->first;
+                  ${gref} = &(it->second);
+                  ${go gs}
+                }
+              |]
 
-  nodes     <- nodeContext <$> ask
-  groupKeys <- mapM compileAST (nodeGroup ctx)
-
-  return $ CompInfo (src x) (ref x) (ctype x) deps tmp $ \msg next -> do
-    let
-      toPrint = map (ctype &&& ref) $ reverse $ x : groupKeys
-      commas  = Exp . intercalate ", " . map getExp
-
-    (fmts, exps) <- unzip <$> mapM (uncurry fmt) toPrint
-    -- exps <- pure . Exp $ intercalate ", " $ show . ref <$> toPrint
-    if msg `Set.member` (_deps deps)
-      then next msg >>= \next -> return [iTrim|
-          printf("${commas fmts}\\n", ${commas exps});
-          ${next}
-        |]
-      else next msg
-
-type NodeID  = Int
+  return $ CompInfo (src x) (ref x) (ctype x) deps tmp cleanup handler
 
 assignNodeIds :: Ord a
   => Signal a
@@ -758,23 +838,24 @@ mapCtxM :: Monad m => (ctx -> m ctx') -> ASTF a ctx b -> m (ASTF a ctx' b)
 mapCtxM f ast = case ast of
   ZipWith ctx op x y  -> run ctx $ \ctx -> ZipWith ctx op x y
   MergeExp ctx x y    -> run ctx $ \ctx -> MergeExp ctx x y
+  MapExp ctx f x      -> run ctx $ \ctx -> MapExp ctx f x
   FoldExp ctx op x    -> run ctx $ \ctx -> FoldExp ctx op x
   ProjectExp ctx p    -> run ctx $ \ctx -> ProjectExp ctx p
   GuardExp ctx pred x -> run ctx $ \ctx -> GuardExp ctx pred x
   LastExp ctx x       -> run ctx $ \ctx -> LastExp ctx x
-  ObserveExp ctx x    -> run ctx $ \ctx -> ObserveExp ctx x
+  ObserveExp ctx o x  -> run ctx $ \ctx -> ObserveExp ctx o x
   ConstExp x          -> return (ConstExp x)
   where
     run ctx withCtx = do { ctx <- f ctx; return (withCtx ctx) }
 
 data Dependencies p = Deps
-  { _deps :: Set (Message p)
-  , _revdeps :: Set (Message p) -- perhaps a better name for this is scope
+  { _deps      :: Set (Message p)
+  , _revdeps   :: Set (Message p) -- perhaps a better name for this is scope
+  , _mustStore :: Bool
   }
-dempty :: Dependencies p
-dempty = Deps Set.empty Set.empty
 
-type Nodes a ctx = IntMap (ASTF a ctx NodeID)
+dempty :: Dependencies p
+dempty = Deps Set.empty Set.empty False
 
 -- calculate dependencies
 calcDeps :: Constraints a
@@ -794,7 +875,7 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       modify $ IMap.insertWith
         (\new old -> old { _deps = _deps old <> _deps new })
         nid
-        (Deps (_deps cdeps) mempty)
+        (Deps (_deps cdeps) mempty False)
       -- cnid reverse depends on nid
       deps <- maybe dempty id . IMap.lookup nid <$> get
       modify $ IMap.adjust
@@ -807,17 +888,22 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       MergeExp _ x y -> do
         nid `depends` x
         nid `depends` y
+      MapExp _ _ x -> do
+        nid `depends` x
       FoldExp _ _ x -> do
         nid `depends` x
       ProjectExp _ p -> do
         let (_field, pmsg) = resolveProjection p
-        modify $ IMap.insert nid (Deps (Set.singleton pmsg) mempty)
+        modify $ IMap.insert nid (Deps (Set.singleton pmsg) mempty False)
       GuardExp _ _pred x -> do
         nid `depends` x -- TODO does `nid` reverse depend on pred .. ?
       LastExp _ x -> do
         nid `depends` x
-      ObserveExp _ x -> do
+      ObserveExp _ Every x -> do
         nid `depends` x
+      ObserveExp _ Summary x -> do
+        nid `depends` x
+        modify $ IMap.adjust (\c -> c { _mustStore = True }) x
       ConstExp {} -> return ()
       where
         ast = nodes ! nid
@@ -836,34 +922,35 @@ compileAST root = go root -- could this use hyloM?
       ZipWith ctx op x y  -> compileOnce nid ctx $ do
         x <- go x
         y <- go y
-        compileZipWith isRoot ctx op x y
+        compileZipWith ctx op x y
       MergeExp ctx x y    -> compileOnce nid ctx $ do
         x <- go x
         y <- go y
-        compileMerge isRoot ctx x y
+        compileMerge ctx x y
+      MapExp ctx f x      -> compileOnce nid ctx $ do
+        x <- go x
+        compileMap ctx f x
       FoldExp ctx op x    -> compileOnce nid ctx $ do
         x <- go x
-        compileFold isRoot ctx op x
+        compileFold ctx op x
       ProjectExp ctx p    -> compileOnce nid ctx $ do
         compileProjection ctx p
       LastExp ctx x       -> compileOnce nid ctx $ do
         x <- go x
-        compileLast isRoot ctx x
+        compileLast ctx x
       GuardExp ctx pred x -> compileOnce nid ctx $ do
-        pred <- go x
+        pred <- go pred
         x    <- go x
-        compileGuard isRoot ctx pred x
-      ObserveExp ctx x    -> compileOnce nid ctx $ do
+        compileGuard ctx pred x
+      ObserveExp ctx o x  -> compileOnce nid ctx $ do
         x <- go x
-        compileObserve isRoot ctx x
+        compileObserve ctx o x
       ConstExp c -> return (compileConstant c)
-      where
-        isRoot = error "Using isRoot deprecated"
 
     -- Only compile the node if it hasn't been compiled yet.
     -- It is IMPORTANT to only compile it once otherwise the topsort
     -- won't work.
-    compileOnce nid (_, Context group _) action = do
+    compileOnce nid (d, Context group _) action = do
       mexists <- (IMap.lookup nid . nodeInfo) <$> get
       case mexists of
         Just compInfo -> return compInfo
@@ -871,7 +958,7 @@ compileAST root = go root -- could this use hyloM?
         Nothing       -> do
           compInfo <- action
 
-          appendTopsort (handler compInfo)
+          appendTopsort compInfo
 
           -- mark seen
           modify $ \st -> st
@@ -881,9 +968,10 @@ compileAST root = go root -- could this use hyloM?
           let
             structData = (ctype compInfo, src compInfo)
             set Nothing = error "Didn't find group info .. "
-            set (Just (compInfo, elems)) = Just (compInfo, structData : elems)
+            set (Just (i, compInfo, elems)) = Just
+              (i, compInfo, structData : elems)
 
-          when (not (tmp compInfo)) $ modify $ \st -> st
+          when (not (tmp compInfo) || _mustStore d) $ modify $ \st -> st
             { groups = Map.alter set group (groups st) }
 
           return compInfo
@@ -968,8 +1056,8 @@ symbolP = do
 
 vwapP :: Signal TAQ -> Peregrine TAQ
 vwapP group = groupBy group $ do
-  px <- project taq "Trade" "Price"
-  sz <- project taq "Trade" "Size"
+  px <- taqTradePrice
+  sz <- taqTradeSize
   value  <- px *. sz
   volume <- foldP Add sz
   value /. volume
@@ -993,7 +1081,9 @@ weightedMidpointP group = groupBy group $ do
   askval <- askpx  *. asksz                 @! "askval"
   totsz  <- bidsz  +. asksz                 @! "totsz"
   tmpsum <- bidval +. askval                @! "tmp"
-  tmpsum /. totsz                           @! "weighted midpoint"
+  pred   <- totsz >. 0
+  ret    <- tmpsum /. totsz
+  guardP pred ret                           @! "weighted midpoint"
 
 midpointSkew :: Signal TAQ -> Peregrine TAQ
 midpointSkew group = do
@@ -1041,7 +1131,7 @@ msgHandler spec peregrine = do
     (CompState nodeInfo struct nodes) = snd iast
     mkCsdecl (ty, id) = CP.mkCsdecl (getIdentifier id) ty
 
-  forM (reverse (Map.elems struct)) $ \(compInfo, elems) -> do
+  forM (reverse (Map.elems struct)) $ \(_name, compInfo, elems) -> do
     -- TODO sort elems by C width
     cstruct (getIdentifier (src compInfo)) $ mkCsdecl `map` elems
 
@@ -1049,11 +1139,12 @@ msgHandler spec peregrine = do
   topDecl [cdecl|$ty:topStateTy $id:foo;|]
   topDecl [cdecl|$ty:topStateTy *$id:topState = &$id:foo;|]
   let
-    handler = runHandleCont (toList nodes)
+    handle         = runHandleCont (handler `map` toList nodes)
+    cleanupHandler = runHandleCont (cleanup `map` toList nodes)
     empty   = const (pure [])
-  return $ CP.MsgHandler handler empty empty
+  return $ CP.MsgHandler handle empty cleanupHandler
 
--- just generates the message handler for inspection / debugging
+-- Turns a peregrine program into compilable code
 p2c :: Peregrine TAQ -> C C.Func
 p2c prog = cmain taqCSpec =<< msgHandler taqCSpec prog
 
@@ -1083,7 +1174,7 @@ taqTradePrice :: Peregrine TAQ
 taqTradePrice = tradeField "Price"
 
 taqTradeSize :: Peregrine TAQ
-taqTradeSize = tradeField "Size"
+taqTradeSize = tradeField "Shares"
 
 quoteField :: String -> Peregrine TAQ -- helper func
 quoteField field = project taq "quote" field @! field
@@ -1118,26 +1209,63 @@ countP :: Signal a -> Peregrine a
 countP sig = do
   sumP =<< (sig -. sig) + 1   @! "count"
 
+sqrtP :: Signal a -> Peregrine a
+sqrtP = mapP (Math "sqrt")
+
+absP :: Signal a -> Peregrine a
+absP = mapP (Math "abs")
+
+infixl 4 <%>
+(<%>) :: Monad m => (a -> m b) -> m a -> m b
+f <%> mx = join (f <$> mx)
+
 covariance :: Signal a -> Signal a -> Peregrine a
 covariance x y = (@! "covariance") $ do
   cross <- (sumP =<< (x *. y))                @! "cross"
   sumx  <- sumP x                             @! "sumx"
   sumy  <- sumP y                             @! "sumy"
-  len   <- countP cross                       @! "len"
+  len   <- countP cross                       @! "rawlen"
+  pred  <- len >. 1
+  len   <- guardP pred len                    @! "len"
   (pure cross - (pure sumx * pure sumy / pure len)) / (pure len - 1)
+
+correlation :: Signal a -> Signal a -> Peregrine a
+correlation x y = (@! "correlation") $ do
+  cross <- covariance x y
+  sdx   <- sqrtP =<< covariance x x
+  sdy   <- sqrtP =<< covariance y y
+  pure cross / (pure sdx * pure sdy)
 
 opts :: CP.CompileOptions
 opts = CP.CompileOptions
-  { debug = True
-  , optLevel = 0
-  , compiler = Clang
+  { debug    = True
+  , optLevel = 3
+  , compiler = GCC
   , filename = "peregrine"
   }
 
-main = CP.compile (CompileOptions True 0 Clang "peregrine") "bin" . p2c $ do
-  s <- symbolP
-  simpleProgram s
-  -- groupBy s $ sumP =<< taqBidPrice
-    -- ret <- join $ covariance <$> taqBidPrice <*> taqAskPrice
-    -- observe ret
+type Pool a = Chan a
 
+withPool :: Pool a -> (a -> IO b) -> IO b
+withPool q io = bracket (readChan q) (writeChan q) io
+
+mkPool :: [a] -> IO (Pool a)
+mkPool as = do
+  pool <- newChan
+  writeList2Chan pool as
+  return pool
+
+main = do
+  CP.compile opts "bin" . p2c $ do
+    s <- symbolP
+    mp <- midpointSkew s
+    -- ret <- vwapP s
+    groupBy s $ do
+      ret <- join $ correlation <$> pure mp <*> taqTradePrice
+      summary ret
+
+  pool <- mkPool (take 8{-num core-} (repeat ()))
+  files <- listDirectory "data/TAQ/"
+  timer "total" $ forConcurrently_ files $ \file -> withPool pool $ \() -> do
+    path <- pure $ "data/TAQ/" ++ file
+    timer file $ callCommand [i|bin/peregrine < ${path}|]
