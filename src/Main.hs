@@ -65,9 +65,9 @@ import qualified Data.Map as Map
 import           Data.Map (Map(..))
 import qualified Data.IntMap as IMap
 import           Data.IntMap (IntMap(..), (!))
-import           Data.Sequence (Seq(..), (|>))
 import qualified Data.Set as Set
 import           Data.Set (Set(..))
+import           Data.Sequence (Seq(..), (|>))
 import           Data.Foldable hiding (fold)
 
 import Data.Function
@@ -1124,7 +1124,15 @@ covariance x y = (@! "covariance") $ do
   len   <- countP cross                       @! "len"
   (pure cross - (pure sumx * pure sumy / pure len)) / (pure len - 1)
 
-main = CP.compile False Clang "bin" "peregrine" . p2c $ do
+opts :: CP.CompileOptions
+opts = CP.CompileOptions
+  { debug = True
+  , optLevel = 0
+  , compiler = Clang
+  , filename = "peregrine"
+  }
+
+main = CP.compile (CompileOptions True 0 Clang "peregrine") "bin" . p2c $ do
   s <- symbolP
   groupBy s $ do
     ret <- join $ covariance <$> taqBidPrice <*> taqAskPrice

@@ -201,13 +201,13 @@ type Debug = Bool
 
 data CCompiler = GCC | Clang
 
-compile :: Debug -> CCompiler -> FilePath -> FilePath -> C a -> IO ()
-compile dbg compiler buildDir oname code = do
+compile :: CompileOptions -> FilePath -> C a -> IO ()
+compile (CompileOptions dbg optLevel compiler oname) buildDir code = do
   writeFile src (codeGen False code)
   putStrLn $ "## " ++ cmd
   callCommand cmd
   where
-    cmd = [qc|{cc} -std=c++11 -march=native -O2 {dbgFlag} -o {out} {src}|]
+    cmd = [qc|{cc} -std=c++11 -march=native -O{optLevel} {dbgFlag} -o {out} {src}|]
     cc  = compilerCmd compiler
     src :: String = [qc|{buildDir}/{oname}.cpp|]
     out :: String = [qc|{buildDir}/{oname}|]
@@ -217,14 +217,21 @@ compilerCmd :: CCompiler -> String
 compilerCmd compiler = case compiler of
   GCC   -> "g++"
   Clang -> "clang++"
+
+data CompileOptions = CompileOptions
+  { debug    :: Debug
+  , optLevel :: Int
+  , compiler :: CCompiler
+  , filename :: FilePath
+  }
  
-compileShake :: Debug -> CCompiler -> FilePath -> FilePath -> C a -> Rules ()
-compileShake dbg compiler buildDir oname code = do
+compileShake :: CompileOptions -> FilePath -> C a -> Rules ()
+compileShake (CompileOptions dbg optLevel compiler oname) buildDir code = do
  
   let
     src = [qc|{buildDir}/{oname}.cpp|]
     out = [qc|{buildDir}/{oname}|]
-    cpp = compilerCmd compiler
+    cc  = compilerCmd compiler
  
   src %> \out -> do
     alwaysRerun
@@ -236,7 +243,7 @@ compileShake dbg compiler buildDir oname code = do
  
     let dbgFlag = switch "-g" "" dbg
     command_ [Cwd buildDir, Shell] -- Compile
-      [qc|{cpp} -std=c++11 -march=native -O2 {dbgFlag} -o {oname} {oname}.cpp|] []
+      [qc|{cc} -std=c++11 -march=native -O{optLevel} {dbgFlag} -o {oname} {oname}.cpp|] []
  
     command_ [Cwd buildDir, Shell] -- Grab the demangled assembly
       [qc|objdump -Cd {oname} > {oname}.s|] []
