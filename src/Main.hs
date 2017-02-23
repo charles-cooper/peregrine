@@ -46,6 +46,7 @@ import Control.Monad.Reader
 import Control.Monad.State
 import Data.Functor.Identity
 import Data.Fix
+import Data.Ratio
 
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma, Pretty(..))
 import           Text.InterpolatedString.Perl6 (q, qc)
@@ -138,6 +139,8 @@ data ASTF
   | GuardExp ctx next next
   -- | One before current
   | LastExp ctx next
+  -- | Observe an expression
+  | ObserveExp ctx next
   -- | A constant
   | ConstExp Constant
   deriving (Show, Eq, Ord, Functor, Foldable, Traversable)
@@ -163,33 +166,30 @@ instance Eq a => Eq (Context a) where
 instance Ord a => Ord (Context a) where
   Context group1 _ `compare` Context group2 _ = group1 `compare` group2
 
-incompleteImplementation :: a
-incompleteImplementation = error "Incomplete Num instance for (Signal a)"
+incomplete :: a
+incomplete = error "Incomplete instance"
 instance Num (Signal a) where
   fromInteger = Fix . ConstExp . ConstInt . fromInteger
-  (+)    = incompleteImplementation
-  (*)    = incompleteImplementation
-  abs    = incompleteImplementation
-  signum = incompleteImplementation
-  negate = incompleteImplementation
+  (+)    = incomplete
+  (*)    = incomplete
+  (-)    = incomplete
+  abs    = incomplete
+  signum = incomplete
 
 instance Num (Peregrine a) where
   fromInteger = return . fromInteger
   a + b       = join $ (+.) <$> a <*> b
   a * b       = join $ (*.) <$> a <*> b
-  abs    = incompleteImplementation
-  signum = incompleteImplementation
-  negate = incompleteImplementation
+  a - b       = join $ (-.) <$> a <*> b
+  abs         = incomplete
+  signum      = incomplete
+
+instance Fractional (Peregrine a) where
+  fromRational x = fromIntegral (numerator x) / fromInteger (denominator x)
+  x / y          = join $ (/.) <$> x <*> y
 
 addAnnotation :: String -> ASTF a (Context b) c -> ASTF a (Context b) c
-addAnnotation s ast = case ast of
-  ZipWith ctx op a b -> ZipWith (setAnn ctx) op a b
-  MergeExp ctx a b -> MergeExp (setAnn ctx) a b
-  FoldExp ctx op a -> FoldExp (setAnn ctx) op a
-  ProjectExp ctx p -> ProjectExp (setAnn ctx) p
-  GuardExp ctx pred a -> GuardExp (setAnn ctx) pred a
-  LastExp ctx a -> LastExp (setAnn ctx) a
-  ConstExp c -> ConstExp c
+addAnnotation s = mapCtx setAnn
   where
     setAnn (Context x _) = Context x (Just s)
 
@@ -230,6 +230,9 @@ guardP pred x = signal $ \ctx -> Fix $ GuardExp ctx (pred) (x)
 
 lastP :: Signal a -> Peregrine a
 lastP x = signal $ \ctx -> Fix $ LastExp ctx (x)
+
+observe :: Signal a -> Peregrine a
+observe x = signal $ \ctx -> Fix $ ObserveExp ctx x
 
 infixl 8 ==.
 infixl 7 <.
@@ -284,14 +287,16 @@ temporary = (== Temporary)
 
 type Fragment = String
 
-type HandleCont a = Message a -> (Message a -> Fragment) -> Fragment
+type HandleCont a = Message a -> (Message a -> C Fragment) -> C Fragment
 type Handler a = [HandleCont a]
 
-runHandleCont :: Ord a => [CompInfo a] -> Message a -> [C.Stm]
-runHandleCont ns msg = [cstms|$escstm:(go ns)|]
+runHandleCont :: Ord a => [CompInfo a] -> Message a -> C [C.Stm]
+runHandleCont ns msg = do
+  stm <- go ns
+  return [cstms|$escstm:(stm)|]
   where
     go ns = case ns of
-      []   -> []
+      []   -> return []
       n:ns -> let k = (handler n)
               in (k msg) (\_msg -> go ns)
 
@@ -392,7 +397,7 @@ groupInfo group = case group of
     let
       src      = Identifier topState
       ref      = Exp topState
-      compInfo = CompInfo src ref errorty dempty False mempty
+      compInfo = CompInfo src ref errorty dempty False (flip ($))
       set      = maybe (Just (compInfo, [])) Just
     modify (\t -> t { groups = Map.alter set group (groups t) })
     return compInfo
@@ -426,7 +431,7 @@ groupInfo group = case group of
         map_    = withCtx parent (Identifier groupId)
         lhs     = withCtx parent (Identifier iterId)
         h       = \msg next -> if msg `Set.member` (_deps deps)
-          then [iTrim|
+          then next msg >>= \next -> return [iTrim|
             if (! ${map_}.count(${key})) {
               ${iter} tmp;/*TODO sane initialization*/
               ${map_}[${key}] = tmp;
@@ -434,7 +439,7 @@ groupInfo group = case group of
             //Set the pointer so future dereferences within this callback
             //will refer to the right thing
             ${lhs} = &((${map_})[${key}]);
-            ${next msg}
+            ${next}
             |]
           else next msg
 
@@ -464,7 +469,7 @@ groupInfo group = case group of
       return ret
 
 compileConstant :: Constant -> CompInfo a
-compileConstant c = CompInfo src value ty dempty tmp mempty
+compileConstant c = CompInfo src value ty dempty tmp (flip ($))
   where
     src         = error "No variable for constant"
     tmp         = True
@@ -482,7 +487,7 @@ compileZipWith :: Constraints a
   -> CompInfo a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileZipWith root (deps, ctx) op x y = do
+compileZipWith _ (deps, ctx) op x y = do
 
   myId <- genLocalId "zip" ctx
   (CompInfo _ group _ _ _ _)  <- groupInfo (nodeGroup ctx)
@@ -492,10 +497,11 @@ compileZipWith root (deps, ctx) op x y = do
   let
     zipExp     = compileOp op ref1 ref2
     storage    = storageRequirement deps
-    -- | should it really depend on root or not
-    tmp        = not root && temporary storage
+    tmp        = temporary storage
     out        = if tmp
-      then zipExp
+      then [i|${Identifier (showC ty)}(${zipExp})|]
+      -- ^ ugly cast. Using SSA (const temp variables)
+      --   will result in clearer code
       else withCtx group myId
     sty1       = CU.simplety ty1
     sty2       = CU.simplety ty2
@@ -506,7 +512,10 @@ compileZipWith root (deps, ctx) op x y = do
         -> error $ "Can't zip types " <> show sty1 <> ", " <> show sty2
       | op == Div || CU.double `elem` [sty1, sty2]
         -> CU.SimpleTy CU.double
-      | op `elem` [Add, Mul, Sub] && CU.signed sty1 == CU.signed sty2
+      | op `elem` [Add, Mul, Sub] && (CU.signed sty1 || CU.signed sty2)
+        -> CU.SimpleTy . CU.signedOf $
+          if CU.width sty1 >= CU.width sty2 then sty1 else sty2
+      | op `elem` [Add, Mul, Sub] -- neither is signed
         -> if CU.width sty1 >= CU.width sty2 then ty1 else ty2
       | op `elem` [Gt, Ge, Lt, Le, Eq]
         -> CU.SimpleTy CU.bool
@@ -515,9 +524,9 @@ compileZipWith root (deps, ctx) op x y = do
 
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     if msg `Set.member` (_deps deps) && (not tmp)
-      then [iTrim|
+      then next msg >>= \next -> return [iTrim|
         ${out} = ${zipExp};
-        ${next msg}
+        ${next}
         |]
       else next msg
 
@@ -541,18 +550,19 @@ compileMerge _ (deps, ctx) x y = do
       else error $ "Tried to merge two unequal types, I don't know what to do"
     tmp        = False -- TODO revisit
 
-  return $ CompInfo myId out ty deps tmp $ \msg next ->
+  return $ CompInfo myId out ty deps tmp $ \msg next -> do
+    next <- next msg
     -- if it's in both deps then it will default to the left
-    if
+    return $ if
       | msg `Set.member` (_deps deps1) -> [iTrim|
         ${out} = ${ref1};
-        ${next msg}
+        ${next}
         |]
       | msg `Set.member` (_deps deps2) -> [iTrim|
           ${out} = ${ref2};
-          ${next msg}
+          ${next}
           |]
-      | otherwise -> next msg
+      | otherwise -> next
 
 storageRequirement :: Ord a => Dependencies a -> Storage
 storageRequirement (Deps deps revdeps) = if revdeps `Set.isSubsetOf` deps
@@ -585,9 +595,9 @@ compileProjection (deps, ctx) p = do
 
   return $ CompInfo myId out ty deps (temporary storage) $ \msg next ->
     if msg == pmsg && permanent storage
-      then [iTrim|
+      then next msg >>= \next -> return [iTrim|
         ${out} = ${cprojection};
-        ${next msg}
+        ${next}
         |]
       else next msg
 
@@ -612,10 +622,10 @@ compileGuard _ (deps, ctx) pred ast = do
 
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     if msg `Set.member` (_deps deps)
-      then [iTrim|
+      then next msg >>= \next -> return [iTrim|
          if (${pred}) {
            ${out} = ${ref};
-           ${next msg}
+           ${next}
          }
        |]
       else next msg
@@ -635,10 +645,10 @@ compileLast _ (deps, ctx) src = do
 
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     if msg `Set.member` (_deps deps)
-      then [iTrim|
+      then next msg >>= \next -> return [iTrim|
 
           // Do whatever depends on the last value
-          ${next msg}
+          ${next}
 
           // Finally, assign to storage
           ${out} = ${ref};
@@ -662,11 +672,49 @@ compileFold _ (deps, ctx) op src = do
   return $ CompInfo myId out ty deps tmp $ \msg next ->
     let exp msg = compileOp op out ref
     in if msg `Set.member` (_deps deps)
-        then [iTrim|
+        then next msg >>= \next -> return [iTrim|
            ${out} = ${exp msg};
-           ${next msg}
+           ${next}
          |]
         else next msg
+
+compileObserve :: Constraints a
+  => Bool
+  -> IContext a
+  -> CompInfo a
+  -> PeregrineC a (CompInfo a)
+compileObserve _ (deps, ctx) x = do
+  (CompInfo _ group _ _ _ _) <- groupInfo (nodeGroup ctx)
+  let
+    tmp = True
+    fmt :: CU.GType -> Exp -> C (Exp, Exp)
+    fmt (CU.SimpleTy ty) e = do
+      sym <- TAQ.symbol
+      return $ if
+        | ty == sym       -> ("%.8s", [i|(char *)(&(${e}))|])
+        | ty == CU.double -> ("%f", e)
+        | ty == CU.long   -> ("%ld", e)
+        | ty == CU.ulong  -> ("%lu", e)
+        | CU.signed ty    -> ("%d", e)
+        | otherwise       -> ("%u", e)
+    fmt (CU.ArrayTy {}) _ = error "TODO format array ty"
+
+  nodes     <- nodeContext <$> ask
+  groupKeys <- mapM compileAST (nodeGroup ctx)
+
+  return $ CompInfo (src x) (ref x) (ctype x) deps tmp $ \msg next -> do
+    let
+      toPrint = map (ctype &&& ref) $ reverse $ x : groupKeys
+      commas  = Exp . intercalate ", " . map getExp
+
+    (fmts, exps) <- unzip <$> mapM (uncurry fmt) toPrint
+    -- exps <- pure . Exp $ intercalate ", " $ show . ref <$> toPrint
+    if msg `Set.member` (_deps deps)
+      then next msg >>= \next -> return [iTrim|
+          printf("${commas fmts}\\n", ${commas exps});
+          ${next}
+        |]
+      else next msg
 
 type NodeID  = Int
 
@@ -702,6 +750,7 @@ mapMCtx f ast = case ast of
   ProjectExp ctx p    -> run ctx $ \ctx -> ProjectExp ctx p
   GuardExp ctx pred x -> run ctx $ \ctx -> GuardExp ctx pred x
   LastExp ctx x       -> run ctx $ \ctx -> LastExp ctx x
+  ObserveExp ctx x    -> run ctx $ \ctx -> ObserveExp ctx x
   ConstExp x          -> return (ConstExp x)
   where
     run ctx withCtx = do { ctx <- f ctx; return (withCtx ctx) }
@@ -739,6 +788,7 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       Just t  -> t
     st = execState (go root) mempty
     depends nid cnid = do
+      go cnid
       -- nid depends on cnid
       cdeps <- maybe dempty id . IMap.lookup cnid <$> get
       modify $ IMap.insertWith
@@ -752,26 +802,21 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
 
     go nid = case nodes ! nid of
       ZipWith _ _ x y -> do
-        go x
-        go y
         nid `depends` x
         nid `depends` y
       MergeExp _ x y -> do
-        go x
-        go y
         nid `depends` x
         nid `depends` y
       FoldExp _ _ x -> do
-        go x
         nid `depends` x
       ProjectExp _ p -> do
         let (_field, pmsg) = resolveProjection p
         modify $ IMap.insert nid (Deps (Set.singleton pmsg) mempty)
       GuardExp _ _pred x -> do
-        go x
         nid `depends` x -- does `nid` reverse depend on pred .. ?
       LastExp _ x -> do
-        go x
+        nid `depends` x
+      ObserveExp _ x -> do
         nid `depends` x
       ConstExp {} -> return ()
 
@@ -806,14 +851,17 @@ compileAST root = go root -- could this use hyloM?
         pred <- go x
         x    <- go x
         compileGuard isRoot ctx pred x
+      ObserveExp ctx x    -> compileOnce nid ctx $ do
+        x <- go x
+        compileObserve isRoot ctx x
       ConstExp c -> return (compileConstant c)
       where
-        isRoot = nid == root
+        isRoot = error "Using isRoot deprecated"
 
     -- Only compile the node if it hasn't been compiled yet.
     -- It is IMPORTANT to only compile it once otherwise the topsort
     -- won't work.
-    compileOnce nid (deps, Context group _) action = do
+    compileOnce nid (_, Context group _) action = do
       mexists <- (IMap.lookup nid . nodeInfo) <$> get
       case mexists of
         Just compInfo -> return compInfo
@@ -833,7 +881,7 @@ compileAST root = go root -- could this use hyloM?
             set Nothing = error "Didn't find group info .. "
             set (Just (compInfo, elems)) = Just (compInfo, structData : elems)
 
-          when (not (tmp compInfo) || nid == root) $ modify $ \st -> st
+          when (not (tmp compInfo)) $ modify $ \st -> st
             { groups = Map.alter set group (groups st) }
 
           return compInfo
@@ -999,7 +1047,7 @@ msgHandler spec peregrine = do
   topDecl [cdecl|$ty:topStateTy $id:foo;|]
   topDecl [cdecl|$ty:topStateTy *$id:topState = &$id:foo;|]
   let
-    handler = \msg -> return (runHandleCont (toList nodes) msg)
+    handler = runHandleCont (toList nodes)
     empty   = const (pure [])
   return $ CP.MsgHandler handler empty empty
 
@@ -1063,6 +1111,22 @@ groupBySymbol signalWithGroup = do
   symbol <- symbolP
   signalWithGroup symbol
 
-main = CP.compile False Clang "bin" "peregrine" $
-  p2c (midpointSkew =<< symbolP)
+-- TODO this generates horrible code.
+countP :: Signal a -> Peregrine a
+countP sig = do
+  sumP =<< (sig -. sig) + 1   @! "count"
+
+covariance :: Signal a -> Signal a -> Peregrine a
+covariance x y = (@! "covariance") $ do
+  cross <- (sumP =<< (x *. y))                @! "cross"
+  sumx  <- sumP x                             @! "sumx"
+  sumy  <- sumP y                             @! "sumy"
+  len   <- countP cross                       @! "len"
+  (pure cross - (pure sumx * pure sumy / pure len)) / (pure len - 1)
+
+main = CP.compile False Clang "bin" "peregrine" . p2c $ do
+  s <- symbolP
+  groupBy s $ do
+    ret <- join $ covariance <$> taqBidPrice <*> taqAskPrice
+    observe ret
 

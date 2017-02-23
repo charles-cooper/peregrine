@@ -1,6 +1,7 @@
 -- Monad for a C EDSL
 
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Language.C.Utils (
@@ -34,6 +35,7 @@ module Language.C.Utils (
   isNumeric,
   signed,
   width,
+  signedOf,
 
   boolExp,
 ) where
@@ -92,6 +94,15 @@ width ty = case () of
   _ | ty `elem` [int, uint]           -> 4
   _ | ty `elem` [long, ulong, double] -> 8
   _ | otherwise -> error $ "Unknown width for type " <> show ty
+
+-- Convert an unsigned integral type into its signed counterpart
+signedOf :: C.Type -> C.Type
+signedOf ty = if
+  | ty == uchar  -> schar
+  | ty == ushort -> short
+  | ty == uint   -> int
+  | ty == ulong  -> long
+  | otherwise    -> ty
 
 data CState = CState
   { _compunit :: CompUnit
