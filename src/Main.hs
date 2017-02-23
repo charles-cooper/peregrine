@@ -1063,7 +1063,6 @@ groupBySymbol signalWithGroup = do
   symbol <- symbolP
   signalWithGroup symbol
 
-main = shakeArgs shakeOptions $ do
-  CP.compileShake False "bin" "peregrine" (p2c (simpleProgram =<< symbolP))
-  want ["bin/peregrine"]
+main = CP.compile False Clang "bin" "peregrine" $
+  p2c (midpointSkew =<< symbolP)
 

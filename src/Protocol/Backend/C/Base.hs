@@ -184,8 +184,8 @@ cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
  
     logBase2 x = finiteBitSize x - 1 - countLeadingZeros x
 
-compile :: Bool -> C a -> String
-compile dbg code = clang_format . s 80 . ppr $ mkCompUnit code
+codeGen :: Bool -> C a -> String
+codeGen dbg code = clang_format . s 80 . ppr $ mkCompUnit code
   where
     s = if dbg
       then prettyPragma
@@ -196,19 +196,39 @@ clang_format = unsafePerformIO . readProcess "clang-format"
   [ "-assume-filename=cpp"
   , "-style={BasedOnStyle: Google, BreakBeforeBraces: Linux, NamespaceIndentation: All}"
   ]
+
+type Debug = Bool
+
+data CCompiler = GCC | Clang
+
+compile :: Debug -> CCompiler -> FilePath -> FilePath -> C a -> IO ()
+compile dbg compiler buildDir oname code = do
+  writeFile src (codeGen False code)
+  putStrLn $ "## " ++ cmd
+  callCommand cmd
+  where
+    cmd = [qc|{cc} -std=c++11 -march=native -O2 {dbgFlag} -o {out} {src}|]
+    cc  = compilerCmd compiler
+    src :: String = [qc|{buildDir}/{oname}.cpp|]
+    out :: String = [qc|{buildDir}/{oname}|]
+    dbgFlag = if dbg then "-g" else ""
+
+compilerCmd :: CCompiler -> String
+compilerCmd compiler = case compiler of
+  GCC   -> "g++"
+  Clang -> "clang++"
  
-compileShake :: Bool -> String -> String -> C a -> Rules ()
-compileShake dbg buildDir oname code = do
+compileShake :: Debug -> CCompiler -> FilePath -> FilePath -> C a -> Rules ()
+compileShake dbg compiler buildDir oname code = do
  
   let
     src = [qc|{buildDir}/{oname}.cpp|]
     out = [qc|{buildDir}/{oname}|]
-    cpp = "clang++"
-
+    cpp = compilerCmd compiler
  
   src %> \out -> do
     alwaysRerun
-    writeFileChanged out $ compile dbg code
+    writeFileChanged out $ codeGen dbg code
  
   out %> \out -> do
  
@@ -221,4 +241,3 @@ compileShake dbg buildDir oname code = do
     command_ [Cwd buildDir, Shell] -- Grab the demangled assembly
       [qc|objdump -Cd {oname} > {oname}.s|] []
  
-
