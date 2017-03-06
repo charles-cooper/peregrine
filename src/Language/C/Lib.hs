@@ -2,20 +2,18 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Language.C.Lib where
-import Text.InterpolatedString.Perl6 (qc)
-import Language.C.Quote.C
-import qualified Language.C.Syntax as C
-import Text.PrettyPrint.Mainland
+import Data.String.Interpolate
 import Language.C.Utils
 
 cReadIntegral ty = do
   mapM include ["cstdint", "cassert", "cctype"]
-  depends impl
+  cfun impl
+  return funName
   where
-    funName :: String = [qc|parse_{pretty 0 $ ppr ty}|]
-    impl = [cfun|
-      $ty:ty $id:(funName) (char const *buf, $ty:uint len) {
-        $ty:ty ret = 0;
+    funName = [i|parse_${ty}|]
+    impl = [i|
+      ${ty} ${funName} (char const *buf, ${uint} len) {
+        ${ty} ret = 0;
         while (len--) {
           assert(isdigit(*buf));
           ret = ret * 10 + (*buf - '0');
@@ -25,20 +23,13 @@ cReadIntegral ty = do
       }
     |]
 
--- C++ stuff
-showc :: Pretty c => c -> String
-showc = pretty 0 . ppr
-
-cpp_string :: C C.Type
+cpp_string :: C Type
 cpp_string = do
   include "string"
-  return [cty|typename $id:("std::string")|]
+  return $ Type [i|std::string|]
 
-cpp_unordered_map :: C.Type -> C.Type -> C C.Type
+cpp_unordered_map :: Type -> Type -> C Type
 cpp_unordered_map k v = do
   include "unordered_map"
-  return [cty|typename $id:ty|]
-  where
-    ty :: String = [qc|std::unordered_map<{showc k}, {showc v}>|]
-
+  return $ Type [i|std::unordered_map<${k}, ${v}>|]
 

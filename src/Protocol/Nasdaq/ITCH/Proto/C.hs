@@ -7,8 +7,7 @@ import Protocol.Nasdaq.ITCH.Proto
 import           Protocol.Backend.C.Base as C
 
 import           Language.C.Utils as C
-import           Language.C.Quote.C
-import qualified Language.C.Syntax as C
+import           Data.String.Interpolate
 
 itchCSpec :: C.Specification ITCH
 itchCSpec = C.Specification
@@ -32,13 +31,13 @@ mkTy f@(Field _ len _ ty _) = do
         | otherwise             = error $ "No rule to make type for "++(show f)
   return ret
 
-readMember :: C.Exp -> C.Exp -> Field ITCH -> C C.Stm
+readMember :: C.Exp -> C.Exp -> Field ITCH -> C Code
 readMember dst src f@(Field _ len _ ty _) = case ty of
   Alpha   -> if len == 1
-   then pure [cstm|$dst = *$src;|]
+   then pure [i|${dst} = *${src};|]
    else do
      include "cstring"
-     return [cstm|memcpy(&$dst, $src, $len);|]
+     return [i|memcpy(&${dst}, ${src}, ${len});|]
   Integer -> runIntegral len
   Price4  -> runIntegral len
   Price8  -> runIntegral len
@@ -47,13 +46,13 @@ readMember dst src f@(Field _ len _ ty _) = case ty of
      include "cstring"
      include "endian.h"
      return $ case len of
-       2 -> [cstm|$dst = be16toh(*(typename uint16_t*)$src);|]
-       4 -> [cstm|$dst = be32toh(*(typename uint32_t*)$src);|]
-       6 -> [cstm|{
-           $dst = 0;
-           memcpy(&$dst, $src, $len);
-           $dst = be64toh($dst) >> 8*(sizeof($dst) - $len);
+       2 -> [i|${dst} = be16toh(*(uint16_t*)${src});|]
+       4 -> [i|${dst} = be32toh(*(uint32_t*)${src});|]
+       6 -> [i|{
+           ${dst} = 0;
+           memcpy(&${dst}, ${src}, ${len});
+           $dst = be64toh(${dst}) >> 8*(sizeof(${dst}) - ${len});
          }|]
-       8 -> [cstm|$dst = be64toh(*(typename uint64_t*)$src);|]
+       8 -> [i|${dst} = be64toh(*(uint64_t*)${src});|]
        _ -> error "Unknown integral length."
 

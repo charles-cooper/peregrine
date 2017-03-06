@@ -24,13 +24,9 @@ import           Protocol.Tmx.TAQ.C as TAQ
 import           Protocol.Nasdaq.ITCH.Proto as ITCH
 import           Protocol.Nasdaq.ITCH.Proto.C as ITCH
 
-import           Language.C.Quote.C
-import qualified Language.C.Syntax as C
-import qualified Language.C.Smart as C ((+=))
-import           Data.Loc
-
 import           Language.Utils
 import qualified Language.C.Utils as CU
+import qualified Language.C.Utils as C
 import           Language.C.Utils (C, depends, include, noloc)
 import           Language.C.Utils (topDecl, require)
 import           Language.C.Utils (char, bool, ushort, uint, ulong)
@@ -297,7 +293,7 @@ infixl 5 *.
 (*.) :: Signal a -> Signal a -> Peregrine a
 (*.) = zipWithP Mul
 
-type GroupStruct = [(CU.GType, Identifier)]
+type GroupStruct = [(CU.GType, C.Identifier)]
 
 -- Flag representing whether a variable is used outside of
 -- its own dependencies. If so it needs to get written to the
@@ -316,35 +312,16 @@ type Fragment = String
 type HandleCont a = Message a -> (Message a -> C Fragment) -> C Fragment
 type Handler a = [HandleCont a]
 
-runHandleCont :: Ord a => [HandleCont a] -> Message a -> C [C.Stm]
-runHandleCont ks msg = do
-  code <- go ks
-  return [cstms|$escstm:(code)|]
+runHandleCont :: Ord a => [HandleCont a] -> Message a -> C C.Code
+runHandleCont ks msg = go ks
   where
     go ks = case ks of
       []   -> return []
       k:ks -> (k msg) (\_msg -> go ks)
 
-newtype Exp = Exp { getExp :: String }
-  deriving (Eq, Ord, Monoid)
-newtype Identifier = Identifier { getIdentifier :: String }
-  deriving (Eq, Ord, Monoid)
-newtype Type = Type { getType :: String }
-  deriving (Eq, Ord)
-
-instance Show Exp where show = getExp
-instance Show Identifier where show = getIdentifier
-instance Show Type where show = getType
-instance IsString Exp where fromString = Exp
-instance IsString Identifier where fromString = Identifier
-instance IsString Type where fromString = Type
-
-type_ :: C.Type -> Type
-type_ = Type . pretty 80 . ppr
-
 data CompInfo p = CompInfo
-  { src          :: Identifier     -- ^ The raw identifier
-  , ref          :: Exp            -- ^ The expression including context
+  { src          :: C.Identifier   -- ^ The raw identifier
+  , ref          :: C.Exp          -- ^ The expression including context
   , ctype        :: CU.GType       -- ^ The C Type
   , dependencies :: Dependencies p -- ^ Set of messages which trigger an update
   , tmp          :: Bool           -- ^ Does not need to be written to storage
@@ -357,7 +334,7 @@ data CompState a = CompState
   -- we can hash or compress representation of the nodes
   { nodeInfo  :: IntMap (CompInfo a)
   -- ^ The compilation info for each node
-  , groups    :: Map IGroup (Identifier, CompInfo a, GroupStruct)
+  , groups    :: Map IGroup (C.Identifier, CompInfo a, GroupStruct)
   -- ^ Map from groups to structs
   , nodeOrder :: Seq (CompInfo a)
   -- ^ An ordered visiting of the nodes
@@ -389,20 +366,20 @@ traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
 trace :: Show a => String -> a -> a
 trace s = traceWith $ ((s++": ")++) . show
 
-genLocalId :: Identifier -> Context a -> PeregrineC b Identifier
+genLocalId :: C.Identifier -> Context a -> PeregrineC b C.Identifier
 -- TODO: generate from a new state for every fence
-genLocalId default_ ctx = lift . lift $ Identifier <$> CU.genId (cnm cid)
+genLocalId default_ ctx = lift . lift $ CU.genId (C.getIdentifier (cnm cid))
   where
-    cid = maybe (getIdentifier default_) id (annotation ctx)
+    cid = maybe (C.getIdentifier default_) id (annotation ctx)
 
 appendTopsort :: CompInfo a -> PeregrineC a ()
 appendTopsort node = do
   modify $ \st -> st { nodeOrder = (nodeOrder st) |> node }
 
-withCtx :: Exp -> Identifier -> Exp
+withCtx :: C.Exp -> C.Identifier -> C.Exp
 withCtx ctx x = [i|${ctx}->${x}|]
 
-compileOp :: BinOp -> Exp -> Exp -> Exp
+compileOp :: BinOp -> CU.Exp -> CU.Exp -> CU.Exp
 compileOp op x y = parens $ case op of
   Add -> [i|${x} + ${y}|]
   Sub -> [i|${x} - ${y}|]
@@ -419,20 +396,20 @@ compileOp op x y = parens $ case op of
 topState :: String -- Identifier
 topState = "state"
 
-topStateTy :: C.Type -- Type
-topStateTy = [cty|typename $id:("struct " ++ topState)|]
+topStateTy :: CU.Type -- Type
+topStateTy = [i|struct ${topState}|]
 
 hempty :: HandleCont p
 hempty = flip ($)
 
 groupInfo :: Constraints a
   => IGroup
-  -> PeregrineC a (Identifier, CompInfo a)
+  -> PeregrineC a (CU.Identifier, CompInfo a)
 groupInfo group = case group of
   []   -> do
     let
-      src      = Identifier topState
-      ref      = Exp topState
+      src      = C.Identifier topState
+      ref      = C.Exp topState
       compInfo = CompInfo src ref errorty dempty False hempty hempty
       set      = maybe (Just (src, compInfo, [])) Just
     modify (\t -> t { groups = Map.alter set group (groups t) })
@@ -447,7 +424,7 @@ groupInfo group = case group of
       Nothing -> do
         (mapName, compInfo) <- genGroupInfo g gs
         appendTopsort compInfo
-        return (Identifier mapName, compInfo)
+        return (mapName, compInfo)
 
   where
     errorty = error "Can't propagate type of group!"
@@ -463,14 +440,14 @@ groupInfo group = case group of
         key     = ref g
         kty     = ctype g
         deps    = dependencies g
-        iter    = [cty|typename $id:("struct " ++ iterId)|]
-        iterPtr = [cty|typename $id:("struct " ++ iterId ++ " *")|]
-        map_    = withCtx parent (Identifier groupId)
-        lhs     = withCtx parent (Identifier iterId)
+        iter    = [i|struct ${iterId}|]
+        iterPtr = [i|struct ${iterId} *|]
+        map_    = withCtx parent groupId
+        lhs     = withCtx parent iterId
         h       = \msg next -> if msg `Set.member` (_deps deps)
           then next msg >>= \next -> return $ trim [i|
             if (! ${map_}.count(${key})) {
-              ${type_ iter} tmp;/*TODO sane initialization*/
+              ${iter} tmp;/*TODO sane initialization*/
               ${map_}[${key}] = tmp;
             }
             //Set the pointer so future dereferences within this callback
@@ -481,8 +458,8 @@ groupInfo group = case group of
           else next msg
 
         ret = CompInfo
-          { src          = (Identifier iterId)
-          , ref          = withCtx parent (Identifier iterId)
+          { src          = iterId
+          , ref          = withCtx parent iterId
           , ctype        = errorty
           , dependencies = error "Can't access Group deps"
           , tmp          = False
@@ -493,15 +470,15 @@ groupInfo group = case group of
       mapTy <- lift . lift $ CL.cpp_unordered_map (CU.simplety kty) iter
 
       let
-        iterData = (CU.SimpleTy iterPtr, Identifier iterId)
-        mapData  = (CU.SimpleTy mapTy, Identifier groupId)
+        iterData = (CU.SimpleTy iterPtr, iterId)
+        mapData  = (CU.SimpleTy mapTy, groupId)
         set Nothing = error "Didn't find group in map.."
         set (Just (i, compInfo, elems)) = Just
           (i, compInfo, iterData : mapData : elems)
 
       -- Insert self into global list of structs
       modify (\t -> t
-        { groups = Map.insert group (Identifier groupId, ret, []) (groups t) })
+        { groups = Map.insert group (groupId, ret, []) (groups t) })
       -- Insert self into parent struct
       modify (\t -> t { groups = Map.alter set gs (groups t) })
 
@@ -512,7 +489,7 @@ compileConstant c = CompInfo src value ty dempty tmp hempty hempty
   where
     src         = error "No variable for constant"
     tmp         = True
-    (value, ty) = first Exp $ case c of
+    (value, ty) = first C.Exp $ case c of
       ConstInt    i -> (show i, CU.SimpleTy CU.int)
       ConstDouble d -> (show d, CU.SimpleTy CU.double)
       ConstBool   b -> (showB b, CU.SimpleTy CU.bool)
@@ -536,7 +513,7 @@ compileZipWith (deps, ctx) op x y = do
     storage    = storageRequirement deps
     tmp        = temporary storage
     out        = if tmp
-      then [i|${type_ (CU.simplety ty)}(${zipExp})|]
+      then [i|${CU.simplety ty}(${zipExp})|]
       -- ^ ugly cast. Using SSA (const temp variables)
       --   will result in clearer code
       else withCtx group myId
@@ -582,7 +559,7 @@ compileMap (deps, ctx) op x = do
     storage = storageRequirement deps
     tmp     = temporary storage
     mapExp  = case op of
-      Math f -> [i|${Identifier f}(${ref x})|]
+      Math f -> [i|${f}(${ref x})|]
     out     = if tmp
       then mapExp
       else withCtx group myId
@@ -649,8 +626,8 @@ compileProjection (deps, ctx) p = do
       else withCtx group myId
     cprojection   = [i|msg.${msgName}.${fieldName}|]
     (field, pmsg) = resolveProjection p
-    msgName       = Identifier . cnm $ _msgName pmsg
-    fieldName     = Identifier . cnm $ _name field
+    msgName       = cnm $ _msgName pmsg
+    fieldName     = cnm $ _name field
 
   ty <- lift . lift $ _mkTy spec field
 
@@ -752,7 +729,7 @@ compileObserve (deps, ctx) observeType x = do
 
   let
     tmp = True
-    fmt :: CU.GType -> Exp -> C (Exp, Exp)
+    fmt :: CU.GType -> C.Exp -> C (C.Exp, C.Exp)
     fmt (CU.SimpleTy ty) e = do
       sym <- TAQ.symbol
       return $ if
@@ -764,7 +741,7 @@ compileObserve (deps, ctx) observeType x = do
         | otherwise       -> ("%u", e)
     fmt (CU.ArrayTy {}) _ = error "TODO format array ty"
     toPrint = map (ctype &&& ref) $ reverse $ x : groupKeys
-    commas  = intercalate "," . map getExp
+    commas  = intercalate "," . map C.getExp
     handler = case observeType of
       Every   -> \msg next -> if msg `Set.member` (_deps deps)
           then do
@@ -791,7 +768,7 @@ compileObserve (deps, ctx) observeType x = do
         msgs = _outgoingMessages (_proto spec)
         forLoop fmts exps gs = go gs
           where
-            gid gs = intercalate "->" $ getIdentifier . fst . snd <$> gs
+            gid gs = intercalate "->" $ C.getIdentifier . fst . snd <$> gs
             go []     = error "Programmer error: Recursed too far"
             go [x]    = [i|printf("${commas fmts}\\n", ${commas exps});|]
             go (g:gs) = let
@@ -1129,15 +1106,15 @@ msgHandler spec peregrine = do
 
   let
     (CompState nodeInfo struct nodes) = snd iast
-    mkCsdecl (ty, id) = CP.mkCsdecl (getIdentifier id) ty
+    mkCsdecl (ty, id) = CP.mkCsdecl (C.getIdentifier id) ty
 
   forM (reverse (Map.elems struct)) $ \(_name, compInfo, elems) -> do
     -- TODO sort elems by C width
-    cstruct (getIdentifier (src compInfo)) $ mkCsdecl `map` elems
+    cstruct (src compInfo) (mkCsdecl `map` elems)
 
   foo <- CU.genId "foo"
-  topDecl [cdecl|$ty:topStateTy $id:foo;|]
-  topDecl [cdecl|$ty:topStateTy *$id:topState = &$id:foo;|]
+  topDecl [i|${topStateTy} ${foo}|]
+  topDecl [i|${topStateTy} *${topState} = &${foo}|]
   let
     handle         = runHandleCont (handler `map` toList nodes)
     cleanupHandler = runHandleCont (cleanup `map` toList nodes)

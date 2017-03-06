@@ -4,9 +4,6 @@
 {-# LANGUAGE RecordWildCards #-}
 module Protocol.Backend.C.Base where
 
-import qualified Language.C.Syntax as C
-import           Language.C.Quote.C
-
 import           Language.C.Utils as C
 
 import           Protocol
@@ -15,8 +12,10 @@ import           Development.Shake
 
 import           Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
 import           Text.InterpolatedString.Perl6
+import           Data.String.Interpolate.IsString
 
 import           Data.Bits
+import           Data.List (intercalate)
 
 import           Utils
 import           Data.Monoid
@@ -30,13 +29,13 @@ import           System.Process
 data Specification a = Specification
   { _proto      :: Proto a
   , _mkTy       :: Field a -> C C.GType
-  , _readMember :: C.Exp -> C.Exp -> Field a -> C C.Stm
+  , _readMember :: C.Exp -> C.Exp -> Field a -> C Code
   }
 
 data MsgHandler a = MsgHandler
-  { _handleMsg  :: Message a -> C [C.Stm]
-  , _initMsg    :: Message a -> C [C.Stm]
-  , _cleanupMsg :: Message a -> C [C.Stm]
+  { _handleMsg  :: Message a -> C Code
+  , _initMsg    :: Message a -> C Code
+  , _cleanupMsg :: Message a -> C Code
   }
 
 -- non-overlapping monoid instance for (a -> m b)
@@ -54,15 +53,17 @@ instance Monoid (MsgHandler a) where
       i3 = i1 `mappend_` i2
       c3 = c1 `mappend_` c2
 
-cstruct :: String -> [C.FieldGroup] -> C C.Type
-cstruct name membs = do
-  depends [cty|struct $id:name {
-    $sdecls:membs
+cstruct :: Identifier -> [(Type, Identifier)] -> C C.Type
+cstruct name members = do
+  cty [i|struct ${name} {
+    ${body}
   }|]
-  return [cty|typename $id:("struct "++name)|]
+  return [i|struct ${name}|]
+  where
+    body = concatMap (\(ty, id) -> [i|${ty} ${id};|]) members
 
-cnm :: String -> String
-cnm = rawIden . cname
+cnm :: String -> Identifier
+cnm = Identifier . rawIden . cname
 
 genStruct :: Specification a -> Message a -> C C.Type
 genStruct spec msg = do
@@ -73,80 +74,84 @@ genStruct spec msg = do
     declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) <$> mkTy f
     mkTy = _mkTy spec
 
-mkCsdecl :: String -> C.GType -> C.FieldGroup                                   
-mkCsdecl nm (C.SimpleTy ty)   = [csdecl|$ty:ty $id:nm;|]
-mkCsdecl nm (C.ArrayTy ty sz) = [csdecl|$ty:ty $id:nm[$sz]; |]
+mkCsdecl :: String -> C.GType -> (Type, Identifier)
+mkCsdecl nm (C.SimpleTy ty)   = (ty, Identifier nm)
+mkCsdecl nm (C.ArrayTy ty sz) = (ty, Identifier [i|${nm}[${sz}]|])
  
-readStruct :: Specification a -> Message a -> C C.Func
+readStruct :: Specification a -> Message a -> C Identifier
 readStruct spec@(Specification {..}) msg = do
   include "cstring"
   require (genStruct spec msg)
   require impl
+  return funName
   where
     impl = do
-      pureStms <- stms
-      depends [cfun|
-        void $id:(funName) (struct $id:(structName) *dst, char const *buf) {
-          $stms:pureStms
+      pureStms <- mkStms
+      cfun [i|
+        void ${funName} (struct ${structName} *dst, char const *buf) {
+          ${concat pureStms}
         }
       |]
-    funName :: String = [qc|read_{structName}|]
+    funName :: Identifier = [qc|read_{structName}|]
     structName        = cnm $ _msgName msg
     ofsts             = scanl (+) 0 (_len <$> _fields msg)
     read ofst field   = _readMember
-      [cexp|dst->$id:(cnm (_name field))|]
-      [cexp|buf + $ofst|]
+      [i|dst->${cnm (_name field)}|]
+      [i|buf + ${ofst}|]
       field
-    stms              = zipWithM read ofsts (_fields msg)
+    mkStms            = zipWithM read ofsts (_fields msg)
  
-mainLoop :: Specification a -> MsgHandler a -> C C.Func
+mainLoop :: Specification a -> MsgHandler a -> C Identifier
 mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
   include "stdio.h"
 
-  structs <- forM (_outgoingMessages _proto) $ \msg -> do
+  structs :: [Code] <- forM (_outgoingMessages _proto) $ \msg -> do
     struct <- require $ genStruct spec msg
-    return [csdecl|struct $id:(cnm $ _msgName msg) $id:(cnm $ _msgName msg);|]
+    return [i|struct ${cnm $ _msgName msg} ${cnm $ _msgName msg}|]
 
-  cases <- forM (_outgoingMessages _proto) $ \msg -> do
+  cases :: [Code] <- forM (_outgoingMessages _proto) $ \msg -> do
     readMsg   <- readStruct spec msg
     struct    <- require $ genStruct spec msg
     handleMsg <- _handleMsg msg
-    let prefix = [cexp|msg.$id:(cnm $ _msgName msg)|]
+    let prefix = Exp [i|msg.${cnm $ _msgName msg}|]
  
-    return [cstm|case $exp:(_tag msg) : {
+    return [i|case ${_tag msg} : {
  
-      if (fread(buf, 1, $(bodyLen _proto msg), stdin) == 0) {
+      if (fread(buf, 1, ${bodyLen _proto msg}, stdin) == 0) {
         return -1;
       }
       /* parse struct */
-      $id:(getId readMsg) (&msg.$id:(cnm $ _msgName msg), buf);
+      ${readMsg} (&msg.${cnm $ _msgName msg}, buf);
  
-      $stms:(handleMsg)
+      ${handleMsg}
  
       break;
  
     }|]
 
   include "cassert"
-  let readHeader = if _pktHdrLen _proto > 0
-        then [cstms|
-          if (fread(buf, 1, $(_pktHdrLen _proto), stdin) == 0) {
-            return -1;
-          }|]
-        else []
-  depends [cfun|
-    int handle(char *buf) {
+  let
+    readHeader = if _pktHdrLen _proto > 0
+      then [i|
+        if (fread(buf, 1, ${_pktHdrLen _proto}, stdin) == 0) {
+          return -1;
+        }|]
+      else []
+    funName = "handle"
+
+  cfun [i|
+    int ${funName}(char *buf) {
       union {
-        $sdecls:structs
+        ${intercalate "\n" $ (++";") `map` structs}
       } msg;
       (void)0;/* Read the packet header if any */
-      $stms:readHeader
+      ${readHeader}
       (void)0;/* Read the packet type */
       if (fread(buf, 1, 1, stdin) == 0) {
         return -1;
       }
       switch (*buf) {
-        $stms:cases
+        ${intercalate "\n" cases}
         default: {
           assert(false);
           return -1;
@@ -155,6 +160,7 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
       return 1;
     }
   |]
+  return (Identifier funName)
  
 cmain :: Specification a -> MsgHandler a -> C C.Func
 cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
@@ -164,20 +170,20 @@ cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
   initMsgs     <- _initMsg `mapM` _outgoingMessages _proto
   cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages _proto
  
-  depends [cfun|int main(int argc, char **argv) {
-    $stms:(concat initMsgs)
-    char buf[$bufLen];
+  cfun [i|int main(int argc, char **argv) {
+    ${concat initMsgs}
+    char buf[${bufLen}];
     int ret = 0;
     int pkts = 0;
  
     while(ret >= 0) {
-      ret = $id:(getId loopStep) (buf);
+      ret = ${loopStep}(buf);
       ++pkts;
     }
  
-    fprintf(stderr, "Cleaning up.\n");
-    $stms:(concat cleanupMsgs)
-    fprintf(stderr, "%d packets\n", pkts);
+    fprintf(stderr, "Cleaning up.\\n");
+    ${concat cleanupMsgs}
+    fprintf(stderr, "%d packets\\n", pkts);
  
   }|]
   where

@@ -4,6 +4,7 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Language.C.Utils (
   C,
   GType(..),
@@ -15,8 +16,16 @@ module Language.C.Utils (
   noloc,
   mkCompUnit,
   genId,
-  Identifiable(..),
-  idExp,
+
+  Type(..),
+  Identifier(..),
+  Exp(..),
+  Func,
+  Code,
+
+  cfun,
+  cty,
+  stms,
 
   char,
   bool,
@@ -42,36 +51,35 @@ module Language.C.Utils (
 
 import Language.Utils
 
-import           Language.C.Quote.C
-import qualified Language.C.Syntax as C
-
 import Text.InterpolatedString.Perl6 (qc)
+import Data.String.Interpolate
+import Data.String
 
 import Data.Loc (SrcLoc(..), Loc(..))
 
 import           Control.Monad.State
 import           Data.Monoid
 import           Data.Maybe
-import           Data.List (nub)
+import           Data.List (nub, intercalate)
 import           Data.Tuple (swap)
 import qualified Data.Map as Map
 import           Data.Map (Map(..))
 
-char   = [cty|char|]
-bool   = [cty|typename bool|]
-double = [cty|double|]
+char   = Type [i|char|]
+bool   = Type [i|bool|]
+double = Type [i|double|]
 
-schar  = [cty|typename int8_t|]
-short  = [cty|typename int16_t|]
-int    = [cty|typename int32_t|]
-long   = [cty|typename int64_t|]
+schar  = Type [i|int8_t|]
+short  = Type [i|int16_t|]
+int    = Type [i|int32_t|]
+long   = Type [i|int64_t|]
 
-uchar  = [cty|typename uint8_t|]
-ushort = [cty|typename uint16_t|]
-uint   = [cty|typename uint32_t|]
-ulong  = [cty|typename uint64_t|]
+uchar  = Type [i|uint8_t|]
+ushort = Type [i|uint16_t|]
+uint   = Type [i|uint32_t|]
+ulong  = Type [i|uint64_t|]
 
-isNumeric :: C.Type -> Bool
+isNumeric :: Type -> Bool
 isNumeric ty = ty `elem`
   [ uchar
   , ushort
@@ -84,10 +92,10 @@ isNumeric ty = ty `elem`
   , double
   ]
 
-signed :: C.Type -> Bool
+signed :: Type -> Bool
 signed ty = ty `elem` [schar, short, int, long]
 
-width :: C.Type -> Int
+width :: Type -> Int
 width ty = case () of
   _ | ty `elem` [char, schar, uchar]  -> 1
   _ | ty `elem` [short, ushort]       -> 2
@@ -96,7 +104,7 @@ width ty = case () of
   _ | otherwise -> error $ "Unknown width for type " <> show ty
 
 -- Convert an unsigned integral type into its signed counterpart
-signedOf :: C.Type -> C.Type
+signedOf :: Type -> Type
 signedOf ty = if
   | ty == uchar  -> schar
   | ty == ushort -> short
@@ -110,22 +118,28 @@ data CState = CState
   }
 
 -- Bool has no toExp instance
-boolExp :: Bool -> C.Exp
-boolExp True  = [cexp|($ty:bool)1|]
-boolExp False = [cexp|($ty:bool)0|]
+boolExp :: Bool -> Exp
+boolExp True  = Exp [i|true|]
+boolExp False = Exp [i|false|]
 
--- Create an expression from an identifier
-idExp :: String -> C.Exp
-idExp id = [cexp|$id:id|]
-
-data Declaration = Def C.Definition | Type C.Type
+newtype Func = Func String
   deriving (Eq, Ord)
+newtype InitGroup = InitGroup String
+  deriving (Eq, Ord)
+newtype Definition = Definition String
+  deriving (Eq, Ord)
+instance Show Func where show (Func d) = d
+instance IsString Func where fromString = Func
+instance Show InitGroup where show (InitGroup d) = d
+instance IsString InitGroup where fromString = InitGroup
+instance Show Definition where show (Definition d) = d
+instance IsString Definition where fromString = Definition
 
 data CompUnit = CompUnit
   { includes  :: InsertionSet Includes
-  , defs      :: InsertionSet Declaration
-  , functions :: InsertionSet C.Func
-  , topLevel  :: InsertionSet C.InitGroup
+  , defs      :: InsertionSet Definition
+  , functions :: InsertionSet Func
+  , topLevel  :: InsertionSet InitGroup
   }
 
 instance Monoid CompUnit where
@@ -138,12 +152,12 @@ instance Monoid CState where
   mappend (CState a b) (CState a' b') = CState (a<>a') (b<>b')
 
 -- TODO come up with better name
-genId :: String -> C String
+genId :: String -> C Identifier
 genId str = do
   st <- get
   let (id, ids') = newId str (_ids st)
   put st { _ids = ids' }
-  return id
+  return (Identifier id)
 
 newtype C a = C { getState :: State CState a }
   deriving (Functor, Applicative, Monad, MonadState CState)
@@ -153,12 +167,21 @@ depends d = do
   modify (\cstate -> cstate { _compunit = _compunit cstate <>define d } )
   return d
 
+cfun :: String -> C Func
+cfun = depends . Func
+
+cty :: String -> C Definition
+cty = depends . Definition
+
+stms :: [Code] -> Code
+stms = intercalate "\n" . map (++";")
+
 -- another way of saying 'id'
 require :: C a -> C a
 require = id
 
 -- monomorphic version of depends for top-level declarations
-topDecl :: C.InitGroup -> C C.InitGroup
+topDecl :: InitGroup -> C InitGroup
 topDecl = depends
 
 include :: String -> C Includes
@@ -172,13 +195,11 @@ class TopLevel a where
   define :: a -> CompUnit
 instance TopLevel Includes where
   define inc  = CompUnit (single inc) e e e
-instance TopLevel C.Definition where
-  define def  = CompUnit e (single (Def def)) e e
-instance TopLevel C.Type where
-  define ty   = CompUnit e (single (Type ty)) e e
-instance TopLevel C.Func where
+instance TopLevel Definition where
+  define def  = CompUnit e (single def) e e
+instance TopLevel Func where
   define func = CompUnit e e (single func) e
-instance TopLevel C.InitGroup where
+instance TopLevel InitGroup where
   define init = CompUnit e e e (single init)
 
 e :: Monoid m => m
@@ -190,40 +211,51 @@ single a = push a mempty
 noloc :: SrcLoc
 noloc = SrcLoc NoLoc
 
+newtype Type = Type { getType :: String }
+  deriving (Eq, Ord)
+
 -- General C type. C AST puts Array metadata in a different part.
 -- This data type lets us pass around array-objects which we can
 -- then compile to C AST
-data GType = ArrayTy  { arrayty :: C.Type, arraysize :: Int }
-           | SimpleTy { simplety :: C.Type }
+data GType = ArrayTy  { arrayty :: Type, arraysize :: Int }
+           | SimpleTy { simplety :: Type }
   deriving Eq
 
-mkCompUnit :: C a -> [C.Definition]
-mkCompUnit code = [cunit|
+type Code = String
+
+mkCompUnit :: C a -> Code
+mkCompUnit code = [i|
     /* Includes */
-    $edecls:(include <$> fromInsertionSet incls)
+    ${intercalate "\n" $ include <$> fromInsertionSet incls}
  
     /* Types */
-    $edecls:(define <$> fromInsertionSet defs)
+    ${intercalate "\n" $ define <$> fromInsertionSet defs}
  
     /* Top level declarations */
-    $edecls:(declare <$> fromInsertionSet decls)
+    ${declare `concatMap` fromInsertionSet decls}
  
     /* Functions */
-    $edecls:(fundecl <$> fromInsertionSet funcs)
+    ${fundecl `concatMap` fromInsertionSet funcs}
   |]
   where
-    includeStr header          = [qc|#include <{header::String}>|]
-    include (Includes header)  = [cedecl|$esc:(includeStr header)|]
-    fundecl func               = [cedecl|$func:func|]
-    define (Def def)           = def
-    define (Type ty)           = [cedecl|$ty:ty;|]
-    declare decl               = [cedecl|$decl:decl;|]
+    includeStr header          = [i|#include <${header}>|]
+    include (Includes header)  = [i|${includeStr header}|]
+    fundecl func               = [i|${func}|]
+    define (Definition def)    = [i|${def};|]
+    declare decl               = [i|${decl};|]
     (CompUnit incls defs funcs decls) = getCompUnit code
 
-class Identifiable a where
-  getId :: a -> C.Id
+newtype Exp = Exp { getExp :: String }
+  deriving (Eq, Ord, Monoid)
 
-instance Identifiable C.Func where
-  getId (C.Func _ iden _ _ _ _)      = iden
-  getId (C.OldFunc _ iden _ _ _ _ _) = iden
+instance Show Exp where show = getExp
+instance Show Identifier where show = getIdentifier
+instance Show Type where show = getType
+
+instance IsString Exp where fromString = Exp
+instance IsString Identifier where fromString = Identifier
+instance IsString Type where fromString = Type
+
+newtype Identifier = Identifier { getIdentifier :: String }
+  deriving (Eq, Ord, Monoid)
 
