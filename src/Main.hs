@@ -57,8 +57,8 @@ import Data.Ratio
 
 import Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma, Pretty(..))
 import           Text.InterpolatedString.Perl6 (q, qc)
-import           Data.String.Here.Interpolated
 import           Data.String
+import           Data.String.Interpolate.IsString
 import qualified Data.Text as T
 
 import Utils
@@ -468,7 +468,7 @@ groupInfo group = case group of
         map_    = withCtx parent (Identifier groupId)
         lhs     = withCtx parent (Identifier iterId)
         h       = \msg next -> if msg `Set.member` (_deps deps)
-          then next msg >>= \next -> return [iTrim|
+          then next msg >>= \next -> return $ trim [i|
             if (! ${map_}.count(${key})) {
               ${type_ iter} tmp;/*TODO sane initialization*/
               ${map_}[${key}] = tmp;
@@ -561,7 +561,7 @@ compileZipWith (deps, ctx) op x y = do
 
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps) && (not tmp)
-      then next msg >>= \next -> return [iTrim|
+      then next msg >>= \next -> return $ trim [i|
         ${out} = ${zipExp};
         ${next}
         |]
@@ -589,7 +589,7 @@ compileMap (deps, ctx) op x = do
 
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps) && (not tmp)
-      then next msg >>= \next -> return [iTrim|
+      then next msg >>= \next -> return $ trim [i|
         ${out} = ${mapExp};
         ${next}
         |]
@@ -616,11 +616,11 @@ compileMerge (deps, ctx) x y = do
     next <- next msg
     -- if it's in both deps then it will default to the left
     return $ if
-      | msg `Set.member` (_deps (dependencies x)) -> [iTrim|
+      | msg `Set.member` (_deps (dependencies x)) -> trim [i|
         ${out} = ${ref x};
         ${next}
         |]
-      | msg `Set.member` (_deps (dependencies y)) -> [iTrim|
+      | msg `Set.member` (_deps (dependencies y)) -> trim [i|
           ${out} = ${ref y};
           ${next}
           |]
@@ -656,7 +656,7 @@ compileProjection (deps, ctx) p = do
 
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg == pmsg && permanent storage
-      then next msg >>= \next -> return [iTrim|
+      then next msg >>= \next -> return $ trim [i|
         ${out} = ${cprojection};
         ${next}
         |]
@@ -682,7 +682,7 @@ compileGuard (deps, ctx) pred ast = do
 
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps)
-      then next msg >>= \next -> return [iTrim|
+      then next msg >>= \next -> return $ trim [i|
          if (${pred}) {
            ${out} = ${ref};
            ${next}
@@ -705,7 +705,7 @@ compileLast (deps, ctx) src = do
 
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps)
-      then next msg >>= \next -> return [iTrim|
+      then next msg >>= \next -> return $ trim [i|
           // Do whatever depends on the last value
           ${next}
           // Finally, assign to storage
@@ -731,7 +731,7 @@ compileFold (deps, ctx) op src = do
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     let exp msg = compileOp op out ref
     in if msg `Set.member` (_deps deps)
-         then next msg >>= \next -> return [iTrim|
+         then next msg >>= \next -> return $ trim [i|
            ${comment}
            ${out} = ${exp msg};
            ${next}
@@ -764,13 +764,13 @@ compileObserve (deps, ctx) observeType x = do
         | otherwise       -> ("%u", e)
     fmt (CU.ArrayTy {}) _ = error "TODO format array ty"
     toPrint = map (ctype &&& ref) $ reverse $ x : groupKeys
-    commas  = Exp . intercalate "," . map getExp
+    commas  = intercalate "," . map getExp
     handler = case observeType of
       Every   -> \msg next -> if msg `Set.member` (_deps deps)
           then do
             next <- next msg
             (fmts, exps) <- unzip <$> mapM (uncurry fmt) toPrint
-            return [iTrim|
+            return $ trim [i|
               printf("${commas fmts}\\n", ${commas exps});
               ${next}
               |]
@@ -791,7 +791,7 @@ compileObserve (deps, ctx) observeType x = do
         msgs = _outgoingMessages (_proto spec)
         forLoop fmts exps gs = go gs
           where
-            gid gs = Exp $ intercalate "->" $ getIdentifier . fst . snd <$> gs
+            gid gs = intercalate "->" $ getIdentifier . fst . snd <$> gs
             go []     = error "Programmer error: Recursed too far"
             go [x]    = [i|printf("${commas fmts}\\n", ${commas exps});|]
             go (g:gs) = let
@@ -800,7 +800,7 @@ compileObserve (deps, ctx) observeType x = do
                 Nothing -> error "Invariant violated: list < len 1"
                 Just g  -> g
               gref = ref (snd (snd g')) -- state->group
-              in [iTrim|for (auto it = ${gid (g:gs)}.begin(); it != ${gid (g:gs)}.end(); ++it)
+              in trim [i|for (auto it = ${gid (g:gs)}.begin(); it != ${gid (g:gs)}.end(); ++it)
                 {
                   ${kref} = it->first;
                   ${gref} = &(it->second);

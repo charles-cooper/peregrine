@@ -6,6 +6,9 @@ resolver: lts-8.2
 # Local packages, usually specified by relative directory name
 packages:
 - '.'
+- location:
+    git: git@github.com:charles-cooper/interpolate.git
+    commit: 9f98be78841bd40380ecbdc1dd91facdd51d30a7
   #- '../language-c-quote'
   #- '../mainland-pretty'
 

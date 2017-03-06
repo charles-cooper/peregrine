@@ -42,7 +42,7 @@ executable machine
                      , mainland-pretty
                      , interpolatedstring-perl6
                      , neat-interpolation
-                     , here
+                     , interpolate
                      , string-conversions
                      , text
                      , srcloc

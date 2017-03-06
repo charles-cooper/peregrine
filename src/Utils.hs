@@ -14,6 +14,12 @@ switch t f p = if p then t else f
 snoc :: [a] -> a -> [a]
 snoc xs y = xs ++ [y]
 
+trim :: String -> String
+trim = trimL . trimR
+  where
+    trimL = dropWhile isSpace
+    trimR = reverse . trimL . reverse
+
 -- shamelessly taken from neat-interpolation
 dedent :: String -> String
 dedent s = case minimumIndent s of
