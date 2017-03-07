@@ -845,18 +845,21 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       Nothing -> dempty
       Just t  -> t
     st = execState (go root) mempty
-    depends nid cnid = do
+
+    fwdDeps nid cnid = do
       go cnid
-      -- nid depends on cnid
       cdeps <- maybe dempty id . IMap.lookup cnid <$> get
       modify $ IMap.insertWith
         (\new old -> old { _deps = _deps old <> _deps new })
         nid
         (Deps (_deps cdeps) mempty False)
-      -- cnid reverse depends on nid
+    revDeps nid cnid = do
       deps <- maybe dempty id . IMap.lookup nid <$> get
       modify $ IMap.adjust
         (\c -> c { _revdeps = _revdeps c <> _deps deps }) cnid
+    depends nid cnid = do
+      nid `fwdDeps` cnid
+      nid `revDeps` cnid
 
     go nid = mapCtxM (mapM go . nodeGroup) ast >> case ast of
       ZipWith _ _ x y -> do
@@ -872,8 +875,9 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       ProjectExp _ p -> do
         let (_field, pmsg) = resolveProjection p
         modify $ IMap.insert nid (Deps (Set.singleton pmsg) mempty False)
-      GuardExp _ _pred x -> do
-        nid `depends` x -- TODO does `nid` reverse depend on pred .. ?
+      GuardExp _ pred x -> do
+        nid `depends` x
+        nid `revDeps` pred
       LastExp _ x -> do
         nid `depends` x
       ObserveExp _ Every x -> do
