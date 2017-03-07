@@ -153,6 +153,8 @@ data ASTF
   | GuardExp ctx next next
   -- | One before current
   | LastExp ctx next
+  -- | Restrict x to only fire when y fires
+  | RestrictExp ctx next next
   -- | Observe an expression
   | ObserveExp ctx Observation next
   -- | A constant
@@ -247,6 +249,9 @@ mapP f x = signal $ \ctx -> Fix $ MapExp ctx f x
 
 guardP :: Signal a -> Signal a -> Peregrine a
 guardP pred x = signal $ \ctx -> Fix $ GuardExp ctx (pred) (x)
+
+restrict :: Signal a -> Signal a -> Peregrine a
+restrict x y = signal $ \ctx -> Fix $ RestrictExp ctx x y
 
 lastP :: Signal a -> Peregrine a
 lastP x = signal $ \ctx -> Fix $ LastExp ctx (x)
@@ -700,6 +705,13 @@ compileLast (deps, ctx) src = do
         |]
       else next msg
 
+compileRestrict :: Constraints a
+  => IContext a
+  -> CompInfo a
+  -> CompInfo a
+  -> PeregrineC a (CompInfo a)
+compileRestrict (deps, ctx) x y = error "TODO compileRestrict"
+
 compileFold :: Constraints a
   => IContext a
   -> BinOp
@@ -831,6 +843,7 @@ mapCtxM f ast = case ast of
   WindowExp ctx p x y -> run ctx $ \ctx -> WindowExp ctx p x y
   GuardExp ctx pred x -> run ctx $ \ctx -> GuardExp ctx pred x
   LastExp ctx x       -> run ctx $ \ctx -> LastExp ctx x
+  RestrictExp ctx x y -> run ctx $ \ctx -> RestrictExp ctx x y
   ObserveExp ctx o x  -> run ctx $ \ctx -> ObserveExp ctx o x
   ConstExp x          -> return (ConstExp x)
   where
@@ -897,6 +910,8 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
         nid `revDeps` pred
       LastExp _ x -> do
         nid `depends` x
+      RestrictExp {} -> do
+        return () -- do we need to do anything here?
       ObserveExp _ Every x -> do
         nid `depends` x
       ObserveExp _ Summary x -> do
@@ -945,6 +960,10 @@ compileAST root = go root -- could this use hyloM?
         pred <- go pred
         x    <- go x
         compileGuard ctx pred x
+      RestrictExp ctx x y -> compileOnce nid ctx $ do
+        x <- go x
+        y <- go y
+        compileRestrict ctx x y
       ObserveExp ctx o x  -> compileOnce nid ctx $ do
         x <- go x
         compileObserve ctx o x
