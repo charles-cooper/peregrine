@@ -1152,7 +1152,7 @@ tradeField :: String -> Peregrine TAQ -- helper func
 tradeField field = project taq "trade" field @! field
 
 taqTradePrice :: Peregrine TAQ
-taqTradePrice = tradeField "Price"
+taqTradePrice = tradeField "Price" / 1000
 
 taqTradeSize :: Peregrine TAQ
 taqTradeSize = tradeField "Shares"
@@ -1161,13 +1161,13 @@ quoteField :: String -> Peregrine TAQ -- helper func
 quoteField field = project taq "quote" field @! field
 
 taqBidPrice :: Peregrine TAQ
-taqBidPrice = quoteField "Bid Price"
+taqBidPrice = quoteField "Bid Price" / 1000
 
 taqBidSize :: Peregrine TAQ
 taqBidSize = quoteField "Bid Size"
 
 taqAskPrice :: Peregrine TAQ
-taqAskPrice = quoteField "Ask Price"
+taqAskPrice = quoteField "Ask Price" / 1000
 
 taqAskSize :: Peregrine TAQ
 taqAskSize = quoteField "Ask Size"
@@ -1202,7 +1202,7 @@ f <%> mx = join (f <$> mx)
 
 covariance :: Signal a -> Signal a -> Peregrine a
 covariance x y = (@! "covariance") $ do
-  cross <- (sumP =<< (x *. y))                @! "cross"
+  cross <- sumP =<< (x *. y)                  @! "cross"
   sumx  <- sumP x                             @! "sumx"
   sumy  <- sumP y                             @! "sumy"
   len   <- countP cross                       @! "rawlen"
@@ -1210,12 +1210,29 @@ covariance x y = (@! "covariance") $ do
   len   <- guardP pred len                    @! "len"
   (pure cross - (pure sumx * pure sumy / pure len)) / (pure len - 1)
 
+variance :: Signal a -> Peregrine a
+variance x = do
+  sumSq <- sumP =<< x *. x
+  sum   <- sumP x
+  len   <- countP x
+  pred  <- len >. 1
+  len   <- guardP pred len
+  (pure sumSq - (pure sum * pure sum / pure len)) / (pure len - 1)
+
 correlation :: Signal a -> Signal a -> Peregrine a
 correlation x y = (@! "correlation") $ do
-  cross <- covariance x y
-  sdx   <- sqrtP =<< covariance x x
-  sdy   <- sqrtP =<< covariance y y
-  pure cross / (pure sdx * pure sdy)
+  cross <- sumP =<< (x *. y)    @! "Cross"
+  sumx  <- sumP x               @! "sum x"
+  sumx2 <- sumP =<< (x *. x)    @! "sum x^2"
+  sumy  <- sumP y               @! "sum y"
+  sumy2 <- sumP =<< (y *. y)    @! "sum y^2"
+  len   <- countP cross         @! "raw len"
+  pred  <- len >. 1
+  len   <- guardP pred len      @! "len"
+  cov  <- (pure cross - (pure sumx * pure sumy / pure len)) / (pure len - 1)
+  varx <- (pure sumx2 - (pure sumx * pure sumx / pure len)) / (pure len - 1)
+  vary <- (pure sumy2 - (pure sumy * pure sumy / pure len)) / (pure len - 1)
+  pure cov / (sqrtP =<< pure varx * pure vary)
 
 opts :: CP.CompileOptions
 opts = CP.CompileOptions
@@ -1239,14 +1256,17 @@ mkPool as = do
 main = do
   CP.compile opts "bin" . p2c $ do
     s <- symbolP
-    mp <- midpointSkew s
+    mps <- midpointSkew s
+    mp  <- midpointP s
+    wmp <- weightedMidpointP s
     -- ret <- vwapP s
     groupBy s $ do
-      ret <- join $ correlation <$> pure mp <*> taqTradePrice
+      ret <- join $ correlation <$> taqBidPrice <*> taqAskPrice
+      -- ret <- taqTradePrice
       summary ret
 
   pool <- mkPool (take 8{-num core-} (repeat ()))
   files <- listDirectory "data/TAQ/"
   timer "total" $ forConcurrently_ files $ \file -> withPool pool $ \() -> do
     path <- pure $ "data/TAQ/" ++ file
-    timer file $ callCommand [i|bin/peregrine < ${path}|]
+    timer file $ callCommand [i|bin/peregrine < ${path} | sort | tee foo|]
