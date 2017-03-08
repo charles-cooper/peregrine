@@ -509,14 +509,14 @@ compileZipWith (deps, ctx) op x y = do
 
   let
     ann        = maybe "" (\x -> "/*"++x++"*/") (annotation ctx)
-    zipExp     = fromString ann <> compileOp op (ref x) (ref y)
     storage    = storageRequirement deps
     tmp        = temporary storage
     out        = if tmp
-      then [i|${CU.simplety ty}(${zipExp})|]
-      -- ^ ugly cast. Using SSA (const temp variables)
-      --   will result in clearer code
+      then zipExp
       else withCtx group myId
+    cast x ty  = [i|${CU.simplety ty}(${x})|]
+    zipExp     = fromString ann
+      <> compileOp op (ref x `cast` ty) (ref y `cast` ty)
     sty1       = CU.simplety (ctype x)
     sty2       = CU.simplety (ctype y)
     ty         = if
