@@ -147,6 +147,8 @@ data ASTF
   -- | A field within message.
   -- Basically a raw signal which comes directly from the protocol
   | ProjectExp ctx (Projection proto)
+  -- | A rolling window
+  | WindowExp ctx next {-pred-} next {-timestamp-} next {-x-}
   -- | Only send updates downstream if the argument is satisfied
   | GuardExp ctx next next
   -- | One before current
@@ -639,6 +641,14 @@ compileProjection (deps, ctx) p = do
         |]
       else next msg
 
+compileWindow :: Constraints a
+  => IContext a
+  -> CompInfo a
+  -> CompInfo a
+  -> CompInfo a
+  -> PeregrineC a (CompInfo a)
+compileWindow (deps, ctx) pred t x = error "TODO compileWindow"
+
 -- TODO this needs to be reasoned about more.
 -- Can something from a guard escape its guard scope? (probably should be able to)
 -- How does it interact with dependencies?
@@ -818,6 +828,7 @@ mapCtxM f ast = case ast of
   MapExp ctx f x      -> run ctx $ \ctx -> MapExp ctx f x
   FoldExp ctx op x    -> run ctx $ \ctx -> FoldExp ctx op x
   ProjectExp ctx p    -> run ctx $ \ctx -> ProjectExp ctx p
+  WindowExp ctx p x y -> run ctx $ \ctx -> WindowExp ctx p x y
   GuardExp ctx pred x -> run ctx $ \ctx -> GuardExp ctx pred x
   LastExp ctx x       -> run ctx $ \ctx -> LastExp ctx x
   ObserveExp ctx o x  -> run ctx $ \ctx -> ObserveExp ctx o x
@@ -875,6 +886,12 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       ProjectExp _ p -> do
         let (_field, pmsg) = resolveProjection p
         modify $ IMap.insert nid (Deps (Set.singleton pmsg) mempty False)
+      WindowExp _ p t x -> do
+        nid `revDeps` p
+        nid `revDeps` t
+        -- ^ don't need to update when the timestamp is updated,
+        -- but do need to have it available
+        nid `depends` x
       GuardExp _ pred x -> do
         nid `depends` x
         nid `revDeps` pred
@@ -916,6 +933,11 @@ compileAST root = go root -- could this use hyloM?
         compileFold ctx op x
       ProjectExp ctx p    -> compileOnce nid ctx $ do
         compileProjection ctx p
+      WindowExp ctx p t x -> compileOnce nid ctx $ do
+        p <- go p
+        t <- go t
+        x <- go x
+        compileWindow ctx p t x
       LastExp ctx x       -> compileOnce nid ctx $ do
         x <- go x
         compileLast ctx x
