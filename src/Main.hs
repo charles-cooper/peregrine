@@ -1112,6 +1112,12 @@ vwapP group = groupBy group $ do
 sumP :: Signal a -> Peregrine a
 sumP xs = foldP Add xs
 
+meanP :: Signal a -> Peregrine a
+meanP xs = do
+  len <- countP xs
+  len <- join $ guardP <$> len >. 0 <*> pure len
+  sumP xs / pure len
+
 midpointP :: Signal TAQ -> Peregrine TAQ
 midpointP group = groupBy group $ do
   x   <- taqBidPrice + taqAskPrice
@@ -1327,12 +1333,9 @@ main = do
     vwap <- vwapP s
     groupBy s $ do
       -- ret <- join $ correlation <$> taqBidPrice <*> taqAskPrice
-      spread <- taqAskPrice - taqBidPrice   @! "spread"
-      len <- countP spread
-      pred <- len >. 0
-      len <- guardP pred len                @! "len"
-      avgSpread <- (sumP spread) / pure len @! "avg spread"
-      ret <- 100 * (avgSpread /. vwap)      @! "avg spread / vwap"
+      spread    <- taqAskPrice - taqBidPrice   @! "spread"
+      avgSpread <- meanP spread                @! "avg spread"
+      ret <- 100 * (avgSpread /. vwap)         @! "avg spread / vwap"
       summary ret
 
   pool <- mkPool (take 8{-num core-} (repeat ()))
