@@ -19,12 +19,13 @@ module Language.C.Utils (
   Type(..),
   Identifier(..),
   Exp(..),
-  Func,
+  Func(..),
   Code,
 
   cfun,
   cty,
   stms,
+  cast,
 
   char,
   bool,
@@ -174,6 +175,11 @@ cty = depends . Definition
 
 stms :: [Code] -> Code
 stms = intercalate "\n" . map (++";")
+
+-- This is starting to get into code generation.
+-- Maybe go in Language.C.Lib?
+cast :: Exp -> Type -> Exp
+cast e ty = Exp [i|${ty}(${e})|]
 
 -- another way of saying 'id'
 require :: C a -> C a

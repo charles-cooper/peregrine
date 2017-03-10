@@ -61,18 +61,42 @@ mkTy f@(Field _ len _ ty _) = do
     | otherwise                -> error "Unknown case."
   return ret
 
+-- C function to convert HHMMSS00 to millis past midnight
+readTime :: C Func
+readTime = do
+  let fname = Func "read_taq_time"
+  cfun [i|
+    ${uint} ${fname}(${uint} const t) {
+      // HHMMSS00
+      ${uint} const hh = t / 1000000;
+      ${uint} const mm = (t / 10000) % 100;
+      ${uint} const ss = (t / 100) % 100;
+      ${uint} const cs = t % 100;/*centi-seconds*/
+      return (cs * 10)
+        + (ss * 1000)
+        + (mm * 60 * 1000)
+        + (hh * 60 * 60 * 1000);
+    }
+    |]
+  return fname
+
+readMember :: Exp -> Exp -> Field TAQ -> C Code
 readMember dst src f@(Field _ len nm ty _) = case ty of
   Numeric    -> runIntegral
   Alphabetic -> return $ if len == 1
                   then [i|${dst} = *${src};|]
                   else [i|memcpy(&${dst}, ${src}, ${len});|]
   Boolean    -> return [i|${dst} = (*${src} == '1');|]
-  Date       -> runIntegral
+  Date       -> runTime
   Time       -> runIntegral
   where
     runIntegral = do
       readInt <- cReadIntegral =<< mkTy f
       return [i|${dst} = ${readInt} (${src}, ${len}); |]
+    runTime = do
+      readTime <- readTime
+      readInt <- cReadIntegral uint
+      return [i|${dst} = ${readTime}(${readInt}(${src}, ${len})); |]
 
 handleMsgGzip :: Message TAQ -> C Code
 handleMsgGzip msg = do
@@ -94,6 +118,7 @@ printFmt root msg = let
       | ty==Boolean     = ([qc|{nm}: %d|], [exp])
       | ty==Date        = ([qc|{nm}: %d|], [exp])
       | ty==Time        = ([qc|{nm}: %d|], [exp])
+      | otherwise       = error "Impossible case"
       where
         exp = [i|${root}.${cnm nm}|]
 

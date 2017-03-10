@@ -92,11 +92,13 @@ instance Show (Projection a) where
     ++ field
     ++ "\""
 
-data BinOp = Add | Mul | Div | Sub | Gt | Ge | Lt | Le | Eq
+data BinOp = Add | Mul | Div | Sub | Gt | Ge | Lt | Le | Eq | Max | Min
   deriving (Eq, Ord, Show)
 
 data UnaryOp
   = Math String -- function name from cmath e.g. "abs"
+  | Cast C.Type
+  | Window String -- member name on function
   deriving (Eq, Ord, Show)
 
 type AssocList a b = [(a, b)]
@@ -148,7 +150,8 @@ data ASTF
   -- Basically a raw signal which comes directly from the protocol
   | ProjectExp ctx (Projection proto)
   -- | A rolling window
-  | WindowExp ctx next {-pred-} next {-timestamp-} next {-x-}
+  --   TODO generalize the window size to arbitrary predicate
+  | WindowExp ctx BinOp Int {-win size in millis-} next {-timestamp-} next {-x-}
   -- | Only send updates downstream if the argument is satisfied
   | GuardExp ctx next next
   -- | One before current
@@ -252,6 +255,9 @@ guardP pred x = signal $ \ctx -> Fix $ GuardExp ctx (pred) (x)
 
 fireWhen :: Signal a -> Signal a -> Peregrine a
 fireWhen x y = signal $ \ctx -> Fix $ RestrictExp ctx x y
+
+window :: BinOp -> Int -> Signal a -> Signal a -> Peregrine a
+window op span t x = signal $ \ctx -> Fix $ WindowExp ctx op span t x
 
 lastP :: Signal a -> Peregrine a
 lastP x = signal $ \ctx -> Fix $ LastExp ctx (x)
@@ -373,9 +379,12 @@ traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
 trace :: Show a => String -> a -> a
 trace s = traceWith $ ((s++": ")++) . show
 
+liftC :: C a -> PeregrineC b a
+liftC = lift . lift
+
 genLocalId :: C.Identifier -> Context a -> PeregrineC b C.Identifier
 -- TODO: generate from a new state for every fence
-genLocalId default_ ctx = lift . lift $ CU.genId (C.getIdentifier (cnm cid))
+genLocalId default_ ctx = liftC $ CU.genId (C.getIdentifier (cnm cid))
   where
     cid = maybe (C.getIdentifier default_) id (annotation ctx)
 
@@ -397,6 +406,8 @@ compileOp op x y = parens $ case op of
   Lt  -> [i|${x} < ${y}|]
   Le  -> [i|${x} <= ${y}|]
   Eq  -> [i|${x} == ${y}|]
+  Max -> [i|${x} > ${y} ? ${x} : ${y}|]
+  Min -> [i|${x} < ${y} ? ${x} : ${y}|]
   where
     parens e = "(" <> e <> ")"
 
@@ -439,8 +450,8 @@ groupInfo group = case group of
     genGroupInfo g gs = do
       parent <- ref . snd <$> groupInfo gs
       -- the type of the struct
-      groupId <- lift . lift $ CU.genId "group_map"
-      iterId  <- lift . lift $ CU.genId "group"
+      groupId <- liftC $ CU.genId "group_map"
+      iterId  <- liftC $ CU.genId "group"
       g <- compileAST g
 
       let
@@ -474,7 +485,7 @@ groupInfo group = case group of
           , cleanup      = hempty
           }
 
-      mapTy <- lift . lift $ CL.cpp_unordered_map kty iter
+      mapTy <- liftC $ CL.cpp_unordered_map kty iter
 
       let
         iterData = (iterPtr, iterId)
@@ -521,9 +532,8 @@ compileZipWith (deps, ctx) op x y = do
     out        = if tmp
       then zipExp
       else withCtx group myId
-    cast x ty  = [i|${ty}(${x})|]
     zipExp     = fromString ann
-      <> compileOp op (ref x `cast` ty) (ref y `cast` ty)
+      <> compileOp op (ref x `C.cast` ty) (ref y `C.cast` ty)
     ty1        = ctype x
     ty2        = ctype y
     ty         = if
@@ -562,7 +572,7 @@ compileMap (deps, ctx) op x = do
   group <- ref . snd <$> groupInfo (nodeGroup ctx)
 
   case op of
-    Math {} -> lift . lift . void $ include "cmath"
+    Math {} -> liftC . void $ include "cmath"
     _       -> return ()
 
   let
@@ -570,7 +580,9 @@ compileMap (deps, ctx) op x = do
     storage = storageRequirement deps
     tmp     = temporary storage
     mapExp  = case op of
-      Math f -> [i|${f}(${ref x})|]
+      Math f   -> [i|${f}(${ref x})|]
+      Cast ty  -> ref x `C.cast` ty
+      Window f -> [i|${ref x}.${f}()|]
     out     = if tmp
       then mapExp
       else withCtx group myId
@@ -640,7 +652,7 @@ compileProjection (deps, ctx) p = do
     msgName       = cnm $ _msgName pmsg
     fieldName     = cnm $ _name field
 
-  ty <- lift . lift $ _mkTy spec field
+  ty <- liftC $ _mkTy spec field
 
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg == pmsg && permanent storage
@@ -652,11 +664,40 @@ compileProjection (deps, ctx) p = do
 
 compileWindow :: Constraints a
   => IContext a
-  -> CompInfo a
+  -> BinOp
+  -> Int
   -> CompInfo a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileWindow (deps, ctx) pred t x = error "TODO compileWindow"
+compileWindow (deps, ctx) op span t x = do
+  myId   <- genLocalId "rolling_window" ctx
+  group  <- ref . snd <$> groupInfo (nodeGroup ctx)
+  elemTy <- liftC $ CL.pair (ctype t) (ctype x)
+
+  let
+    k1 x   = [i|${x}.second|]
+    k2 x y = compileOp op x y
+
+  ty     <- liftC $ CL.rolling_window elemTy (ctype x) k1 k2
+  let
+    out = withCtx group myId
+    tmp = False
+
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next -> do
+    next <- next msg
+    if msg `Set.member` (_deps deps)
+      then do
+        return $ trim [i|
+
+          ${out}.push(std::make_pair(${ref t}, ${ref x}));
+          while (${out}.size() && ${out}.peek_front().first - ${out}.peek_back().first > ${span}) {
+            ${out}.pop();
+          }
+
+          ${next}
+
+        |]
+      else return next
 
 -- TODO this needs to be reasoned about more.
 -- Can something from a guard escape its guard scope? (probably should be able to)
@@ -858,17 +899,17 @@ mapCtx f = runIdentity . mapCtxM (return . f)
 
 mapCtxM :: Monad m => (ctx -> m ctx') -> ASTF a ctx b -> m (ASTF a ctx' b)
 mapCtxM f ast = case ast of
-  ZipWith ctx op x y  -> run ctx $ \ctx -> ZipWith ctx op x y
-  MergeExp ctx x y    -> run ctx $ \ctx -> MergeExp ctx x y
-  MapExp ctx f x      -> run ctx $ \ctx -> MapExp ctx f x
-  FoldExp ctx op x    -> run ctx $ \ctx -> FoldExp ctx op x
-  ProjectExp ctx p    -> run ctx $ \ctx -> ProjectExp ctx p
-  WindowExp ctx p x y -> run ctx $ \ctx -> WindowExp ctx p x y
-  GuardExp ctx pred x -> run ctx $ \ctx -> GuardExp ctx pred x
-  LastExp ctx x       -> run ctx $ \ctx -> LastExp ctx x
-  RestrictExp ctx x y -> run ctx $ \ctx -> RestrictExp ctx x y
-  ObserveExp ctx o x  -> run ctx $ \ctx -> ObserveExp ctx o x
-  ConstExp x          -> return (ConstExp x)
+  ZipWith ctx op x y    -> run ctx $ \ctx -> ZipWith ctx op x y
+  MergeExp ctx x y      -> run ctx $ \ctx -> MergeExp ctx x y
+  MapExp ctx f x        -> run ctx $ \ctx -> MapExp ctx f x
+  FoldExp ctx op x      -> run ctx $ \ctx -> FoldExp ctx op x
+  ProjectExp ctx p      -> run ctx $ \ctx -> ProjectExp ctx p
+  WindowExp ctx o p x y -> run ctx $ \ctx -> WindowExp ctx o p x y
+  GuardExp ctx pred x   -> run ctx $ \ctx -> GuardExp ctx pred x
+  LastExp ctx x         -> run ctx $ \ctx -> LastExp ctx x
+  RestrictExp ctx x y   -> run ctx $ \ctx -> RestrictExp ctx x y
+  ObserveExp ctx o x    -> run ctx $ \ctx -> ObserveExp ctx o x
+  ConstExp x            -> return (ConstExp x)
   where
     run ctx withCtx = do { ctx <- f ctx; return (withCtx ctx) }
 
@@ -922,7 +963,7 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
       ProjectExp _ p -> do
         let (_field, pmsg) = resolveProjection p
         modify $ IMap.insert nid (Deps (Set.singleton pmsg) mempty False)
-      WindowExp _ p t x -> do
+      WindowExp _ _ p t x -> do
         nid `revDeps` p
         nid `revDeps` t
         -- ^ don't need to update when the timestamp is updated,
@@ -976,11 +1017,10 @@ compileAST root = go root -- could this use hyloM?
         compileFold ctx op x
       ProjectExp ctx p    -> compileOnce nid ctx $ do
         compileProjection ctx p
-      WindowExp ctx p t x -> compileOnce nid ctx $ do
-        p <- go p
+      WindowExp ctx op s t x -> compileOnce nid ctx $ do
         t <- go t
         x <- go x
-        compileWindow ctx p t x
+        compileWindow ctx op s t x
       LastExp ctx x       -> compileOnce nid ctx $ do
         x <- go x
         compileLast ctx x
@@ -1232,6 +1272,9 @@ taqTradePrice = tradeField "Price" / 1000
 taqTradeSize :: Peregrine TAQ
 taqTradeSize = tradeField "Shares"
 
+taqTradeTime :: Peregrine TAQ
+taqTradeTime = tradeField "Trade Time"
+
 quoteField :: String -> Peregrine TAQ -- helper func
 quoteField field = project taq "quote" field @! field
 
@@ -1339,6 +1382,14 @@ main = do
       spread    <- taqAskPrice - taqBidPrice   @! "spread"
       avgSpread <- meanP spread                @! "avg spread"
       ret <- 100 * (avgSpread /. vwap)         @! "avg spread / vwap"
+
+      t   <- taqTradeTime
+      px  <- taqTradePrice
+      maxWin <- window Max 1000 t px           @! "max window"
+      minWin <- window Min 1000 t px           @! "min window"
+      let accum = mapP (Window "accumulate")
+      spike  <- accum maxWin - accum minWin    @! "spike"
+      ret <- foldP Max spike                   @! "max spike over day"
       summary ret
 
   pool <- mkPool (take 8{-num core-} (repeat ()))

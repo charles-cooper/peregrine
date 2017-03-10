@@ -7,14 +7,16 @@ module Language.C.Lib where
 import Data.String.Interpolate
 import Language.C.Utils
 
+arrayTy :: Type -> Int -> C Type
 arrayTy ty len = do
   include "array"
   return $ Type [i|std::array<${ty}, ${len}>|]
 
+cReadIntegral :: Type -> C Func
 cReadIntegral ty = do
   mapM include ["cstdint", "cassert", "cctype"]
   cfun impl
-  return funName
+  return (Func funName)
   where
     funName = [i|parse_${ty}|]
     impl = [i|
@@ -39,23 +41,31 @@ cpp_unordered_map k v = do
   include "unordered_map"
   return $ Type [i|std::unordered_map<${k}, ${v}>|]
 
-rolling_window :: Type -> (Exp -> Exp -> Exp) -> C Type
-rolling_window ty op = do
+pair :: Type -> Type -> C Type
+pair x y = do
+  include "utility"
+  return $ Type [i|std::pair<${x}, ${y}>|]
+
+rolling_window :: Type -> Type -> (Exp -> Exp) -> (Exp -> Exp -> Exp) -> C Type
+rolling_window dataTy accTy unOp binOp = do
   include "vector"
   cty window_class -- define the window class
   opName <- genId "op"
   cty (opTy opName)
-  return $ Type [i|window<${ty}, struct ${opName}>|]
+  return $ Type [i|window<${dataTy}, ${accTy}, struct ${opName}>|]
   where
     opTy opName = [i|
       struct ${opName} {
-        ${ty} operator ()(${ty} x, ${ty} y) {
-          return ${op (Exp "x") (Exp "y")};
+        ${accTy} operator ()(${accTy} const &x, ${accTy} const &y) const {
+          return ${binOp (Exp "x") (Exp "y")};
+        }
+        ${accTy} operator ()(${dataTy} const &x) const {
+          return ${unOp (Exp "x")};
         }
       };
       |]
     window_class = [i|
-      template<typename T, typename Op>
+      template<typename T, typename Acc, typename Op>
       class window
       {
 #if DEBUG_CONTAINER
@@ -64,8 +74,8 @@ rolling_window ty op = do
         Op op;
         typedef struct
         {
-          T data;
-          T acc;
+          T   data;
+          Acc acc;
         } element_t;
         std::vector<element_t> front;
         std::vector<element_t> back;
@@ -78,7 +88,7 @@ rolling_window ty op = do
             // Initialize its accumulator to the value.
             element_t e;
             e.data = t;
-            e.acc = t;
+            e.acc = op(t);
             front.push_back(e);
 
           } else {
@@ -86,7 +96,7 @@ rolling_window ty op = do
             // accumulating whatever is already there.
             element_t e;
             e.data = t;
-            e.acc = op(t, front.back().acc);
+            e.acc = op(op(t), front.back().acc);
             front.push_back(e);
 
           }
@@ -102,7 +112,7 @@ rolling_window ty op = do
 
             // push the first element onto the back stack.
             element_t e = front.back();
-            e.acc = e.data;
+            e.acc = op(e.data);
             back.push_back(e);
             front.pop_back();
 
@@ -112,7 +122,7 @@ rolling_window ty op = do
             // that would be slow. just loop and then clear the front
             for (size_t i = front.size(); i != 0; i--) {
               element_t e = front[i - 1];
-              e.acc = op(e.data, back.back().acc);
+              e.acc = op(op(e.data), back.back().acc);
               back.push_back(e);
             }
 
@@ -127,10 +137,11 @@ rolling_window ty op = do
           }
         }
 
-        T const &peek(void) const {
+        // Peek oldest element in the queue
+        T const &peek_back(void) const {
           // UNDEFINED BEHAVIOR
           if (empty()) {
-            return front.front().acc;
+            return front.front().data;
           }
 
           // The oldest element in the FIFO queue
@@ -151,7 +162,23 @@ rolling_window ty op = do
 
         }
 
-        T accumulate(void) const {
+        // Peek newest element in the queue
+        T const &peek_front(void) const {
+          if (empty()) {
+            return front.front().data;
+          }
+          // The newest element in the FIFO queue
+          // is the TOP of the first LIFO stack.
+          // If the first LIFO stack is empty,
+          // it is the BOTTOM of the second LIFO stack.
+          if (front.empty()) {
+            return back.front().data;
+          }
+
+          return front.back().data;
+        }
+
+        Acc accumulate(void) const {
           // UNDEFINED BEHAVIOR
           if (empty()) {
             return front.front().acc;

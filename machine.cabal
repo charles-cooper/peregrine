@@ -17,6 +17,7 @@ executable machine
   main-is:             Main.hs
   ghc-options:
     -fwarn-incomplete-patterns
+    -fwarn-incomplete-uni-patterns
     -fwarn-missing-fields
     -freverse-errors
     -threaded
