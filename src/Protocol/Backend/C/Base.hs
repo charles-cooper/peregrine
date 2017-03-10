@@ -165,7 +165,6 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
 cmain :: Specification a -> MsgHandler a -> C C.Func
 cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
   include "cstdio"
-  include "cmath" -- lazy, just assume the code might use it
   loopStep     <- mainLoop spec handler
   initMsgs     <- _initMsg `mapM` _outgoingMessages _proto
   cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages _proto

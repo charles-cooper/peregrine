@@ -561,6 +561,10 @@ compileMap (deps, ctx) op x = do
   myId  <- genLocalId "fmap" ctx
   group <- ref . snd <$> groupInfo (nodeGroup ctx)
 
+  case op of
+    Math {} -> lift . lift . void $ include "cmath"
+    _       -> return ()
+
   let
     ty      = CU.SimpleTy CU.double -- TODO revisit
     storage = storageRequirement deps
