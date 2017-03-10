@@ -710,7 +710,27 @@ compileRestrict :: Constraints a
   -> CompInfo a
   -> CompInfo a
   -> PeregrineC a (CompInfo a)
-compileRestrict (deps, ctx) x y = error "TODO compileRestrict"
+compileRestrict (deps, ctx) x _y = do
+  myId  <- genLocalId "restrict" ctx
+  group <- ref . snd <$> groupInfo (nodeGroup ctx)
+  ref   <- pure (ref x)
+  ty    <- pure (ctype x)
+
+  let
+    storage = storageRequirement deps
+    tmp     = temporary storage
+    out     = if tmp
+      then ref
+      else withCtx group myId
+
+  return $ CompInfo myId out ty deps tmp hempty $ \msg next -> do
+    next <- next msg
+    return $ if permanent storage && msg `Set.member` (_deps deps)
+      then trim [i|
+          ${out} = ${ref}
+          ${next}
+        |]
+      else next
 
 compileFold :: Constraints a
   => IContext a
@@ -910,8 +930,13 @@ calcDeps root nodes = IMap.mapWithKey (\k -> mapCtx ((st !. k),)) nodes
         nid `revDeps` pred
       LastExp _ x -> do
         nid `depends` x
-      RestrictExp {} -> do
-        return () -- do we need to do anything here?
+      RestrictExp _ x y -> do
+        go y
+        modify $ \st -> IMap.insert nid (st !. y) st
+        -- if x is trade price and y is bid price,
+        -- we need to store x so that when we reference
+        -- it from the quote domain it is available.
+        nid `revDeps` x
       ObserveExp _ Every x -> do
         nid `depends` x
       ObserveExp _ Summary x -> do
@@ -1226,10 +1251,9 @@ groupBySymbol signalWithGroup = do
   symbol <- symbolP
   signalWithGroup symbol
 
--- TODO this generates horrible code.
 countP :: Signal a -> Peregrine a
-countP sig = do
-  sumP =<< (sig -. sig) + 1   @! "count"
+countP sig = (@! "count") $ do
+  sumP =<< 1 `restrict` sig
 
 sqrtP :: Signal a -> Peregrine a
 sqrtP = mapP (Math "sqrt")
