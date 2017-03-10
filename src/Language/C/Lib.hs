@@ -1,9 +1,15 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- mostly C++ wrapper stuff
+
 module Language.C.Lib where
 import Data.String.Interpolate
 import Language.C.Utils
+
+arrayTy ty len = do
+  include "array"
+  return $ Type [i|std::array<${ty}, ${len}>|]
 
 cReadIntegral ty = do
   mapM include ["cstdint", "cassert", "cctype"]

@@ -300,7 +300,7 @@ infixl 5 *.
 (*.) :: Signal a -> Signal a -> Peregrine a
 (*.) = zipWithP Mul
 
-type GroupStruct = [(CU.GType, C.Identifier)]
+type GroupStruct = [(CU.Type, C.Identifier)]
 
 -- Flag representing whether a variable is used outside of
 -- its own dependencies. If so it needs to get written to the
@@ -329,7 +329,7 @@ runHandleCont ks msg = go ks
 data CompInfo p = CompInfo
   { src          :: C.Identifier   -- ^ The raw identifier
   , ref          :: C.Exp          -- ^ The expression including context
-  , ctype        :: CU.GType       -- ^ The C Type
+  , ctype        :: CU.Type        -- ^ The C Type
   , dependencies :: Dependencies p -- ^ Set of messages which trigger an update
   , tmp          :: Bool           -- ^ Does not need to be written to storage
   , cleanup      :: HandleCont p   -- ^ What to do at the end
@@ -474,11 +474,11 @@ groupInfo group = case group of
           , cleanup      = hempty
           }
 
-      mapTy <- lift . lift $ CL.cpp_unordered_map (CU.simplety kty) iter
+      mapTy <- lift . lift $ CL.cpp_unordered_map kty iter
 
       let
-        iterData = (CU.SimpleTy iterPtr, iterId)
-        mapData  = (CU.SimpleTy mapTy, groupId)
+        iterData = (iterPtr, iterId)
+        mapData  = (mapTy, groupId)
         set Nothing = error "Didn't find group in map.."
         set (Just (i, compInfo, elems)) = Just
           (i, compInfo, iterData : mapData : elems)
@@ -497,9 +497,9 @@ compileConstant c = CompInfo src value ty dempty tmp hempty hempty
     src         = error "No variable for constant"
     tmp         = True
     (value, ty) = first C.Exp $ case c of
-      ConstInt    i -> (show i, CU.SimpleTy CU.int)
-      ConstDouble d -> (show d, CU.SimpleTy CU.double)
-      ConstBool   b -> (showB b, CU.SimpleTy CU.bool)
+      ConstInt    i -> (show i, CU.int)
+      ConstDouble d -> (show d, CU.double)
+      ConstBool   b -> (showB b, CU.bool)
       where
         showB b = if b then "true" else "false"
 
@@ -521,27 +521,27 @@ compileZipWith (deps, ctx) op x y = do
     out        = if tmp
       then zipExp
       else withCtx group myId
-    cast x ty  = [i|${CU.simplety ty}(${x})|]
+    cast x ty  = [i|${ty}(${x})|]
     zipExp     = fromString ann
       <> compileOp op (ref x `cast` ty) (ref y `cast` ty)
-    sty1       = CU.simplety (ctype x)
-    sty2       = CU.simplety (ctype y)
+    ty1        = ctype x
+    ty2        = ctype y
     ty         = if
-      | (ctype x) == (ctype y)
-        -> (ctype x)
-      | not (CU.isNumeric sty1) || not (CU.isNumeric sty2)
-        -> error $ "Can't zip types " <> show sty1 <> ", " <> show sty2
-      | op == Div || CU.double `elem` [sty1, sty2]
-        -> CU.SimpleTy CU.double
-      | op `elem` [Add, Mul, Sub] && (CU.signed sty1 || CU.signed sty2)
-        -> CU.SimpleTy . CU.signedOf $
-          if CU.width sty1 >= CU.width sty2 then sty1 else sty2
+      | ty1 == ty2
+        -> ty1
+      | not (CU.isNumeric ty1) || not (CU.isNumeric ty2)
+        -> error $ "Can't zip types " <> show ty1 <> ", " <> show ty2
+      | op == Div || CU.double `elem` [ty1, ty2]
+        -> CU.double
+      | op `elem` [Add, Mul, Sub] && (CU.signed ty1 || CU.signed ty2)
+        -> CU.signedOf $
+          if CU.width ty1 >= CU.width ty2 then ty1 else ty2
       | op `elem` [Add, Mul, Sub] -- neither is signed
-        -> CU.SimpleTy (if CU.width sty1 >= CU.width sty2 then sty1 else sty2)
+        -> (if CU.width ty1 >= CU.width ty2 then ty1 else ty2)
       | op `elem` [Gt, Ge, Lt, Le, Eq]
-        -> CU.SimpleTy CU.bool
+        -> CU.bool
       | otherwise
-        -> error $ "Can't zip numeric types??" <> show sty1 <> ", " <> show sty2
+        -> error $ "Can't zip numeric types??" <> show ty1 <> ", " <> show ty2
 
   return $ CompInfo myId out ty deps tmp hempty $ \msg next ->
     if msg `Set.member` (_deps deps) && (not tmp)
@@ -566,7 +566,7 @@ compileMap (deps, ctx) op x = do
     _       -> return ()
 
   let
-    ty      = CU.SimpleTy CU.double -- TODO revisit
+    ty      = CU.double -- TODO revisit
     storage = storageRequirement deps
     tmp     = temporary storage
     mapExp  = case op of
@@ -775,8 +775,8 @@ compileObserve (deps, ctx) observeType x = do
 
   let
     tmp = True
-    fmt :: CU.GType -> C.Exp -> C (C.Exp, C.Exp)
-    fmt (CU.SimpleTy ty) e = do
+    fmt :: CU.Type -> C.Exp -> C (C.Exp, C.Exp)
+    fmt ty e = do
       sym <- TAQ.symbol
       return $ if
         | ty == sym       -> ("%.8s", [i|(char *)(&(${e}))|])
@@ -785,7 +785,6 @@ compileObserve (deps, ctx) observeType x = do
         | ty == CU.ulong  -> ("%lu", e)
         | CU.signed ty    -> ("%d", e)
         | otherwise       -> ("%u", e)
-    fmt (CU.ArrayTy {}) _ = error "TODO format array ty"
     toPrint = map (ctype &&& ref) $ reverse $ x : groupKeys
     commas  = intercalate "," . map C.getExp
     handler = case observeType of

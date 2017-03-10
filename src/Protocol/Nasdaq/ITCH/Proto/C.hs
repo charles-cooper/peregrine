@@ -1,4 +1,5 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE MultiWayIf #-}
 module Protocol.Nasdaq.ITCH.Proto.C where
 
 import Protocol
@@ -7,6 +8,7 @@ import Protocol.Nasdaq.ITCH.Proto
 import           Protocol.Backend.C.Base as C
 
 import           Language.C.Utils as C
+import           Language.C.Lib as CL
 import           Data.String.Interpolate
 
 itchCSpec :: C.Specification ITCH
@@ -16,20 +18,19 @@ itchCSpec = C.Specification
   , _readMember = readMember
   }
 
-mkTy :: Field ITCH -> C C.GType
+mkTy :: Field ITCH -> C C.Type
 mkTy f@(Field _ len _ ty _) = do
   include "cstdint"
-  let ret
-        | ty==Alpha   && len==1 = C.SimpleTy char
-        | ty==Alpha             = C.ArrayTy char len
-        | ty==Integer && len==2 = C.SimpleTy ushort
-        | ty==Integer && len==4 = C.SimpleTy uint
-        | ty==Integer && len==6 = C.SimpleTy ulong
-        | ty==Integer && len==8 = C.SimpleTy ulong
-        | ty==Price4  && len==4 = C.SimpleTy uint
-        | ty==Price8  && len==8 = C.SimpleTy ulong
-        | otherwise             = error $ "No rule to make type for "++(show f)
-  return ret
+  if
+    | ty==Alpha   && len==1 -> pure char
+    | ty==Alpha             -> CL.arrayTy char len
+    | ty==Integer && len==2 -> return ushort
+    | ty==Integer && len==4 -> return uint
+    | ty==Integer && len==6 -> return ulong
+    | ty==Integer && len==8 -> return ulong
+    | ty==Price4  && len==4 -> return uint
+    | ty==Price8  && len==8 -> return ulong
+    | otherwise             -> error $ "No rule to make type for "++(show f)
 
 readMember :: C.Exp -> C.Exp -> Field ITCH -> C Code
 readMember dst src f@(Field _ len _ ty _) = case ty of

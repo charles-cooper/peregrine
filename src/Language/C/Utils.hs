@@ -7,7 +7,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Language.C.Utils (
   C,
-  GType(..),
   Includes(..),
   depends,
   include,
@@ -213,13 +212,6 @@ noloc = SrcLoc NoLoc
 
 newtype Type = Type { getType :: String }
   deriving (Eq, Ord)
-
--- General C type. C AST puts Array metadata in a different part.
--- This data type lets us pass around array-objects which we can
--- then compile to C AST
-data GType = ArrayTy  { arrayty :: Type, arraysize :: Int }
-           | SimpleTy { simplety :: Type }
-  deriving Eq
 
 type Code = String
 

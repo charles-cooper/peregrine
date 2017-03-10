@@ -28,7 +28,7 @@ import           System.Process
 
 data Specification a = Specification
   { _proto      :: Proto a
-  , _mkTy       :: Field a -> C C.GType
+  , _mkTy       :: Field a -> C Type
   , _readMember :: C.Exp -> C.Exp -> Field a -> C Code
   }
 
@@ -74,9 +74,9 @@ genStruct spec msg = do
     declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) <$> mkTy f
     mkTy = _mkTy spec
 
-mkCsdecl :: String -> C.GType -> (Type, Identifier)
-mkCsdecl nm (C.SimpleTy ty)   = (ty, Identifier nm)
-mkCsdecl nm (C.ArrayTy ty sz) = (ty, Identifier [i|${nm}[${sz}]|])
+mkCsdecl :: String -> C.Type -> (C.Type, C.Identifier)
+mkCsdecl nm ty = (ty, Identifier nm)
+-- mkCsdecl nm (C.ArrayTy ty sz) = (ty, Identifier [i|${nm}[${sz}]|])
  
 readStruct :: Specification a -> Message a -> C Identifier
 readStruct spec@(Specification {..}) msg = do

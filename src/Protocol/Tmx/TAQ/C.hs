@@ -1,5 +1,6 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE MultiWayIf #-}
 module Protocol.Tmx.TAQ.C where
 import Protocol
 import Protocol.Tmx.TAQ
@@ -45,20 +46,19 @@ symbol = do
       }
     |]
 
-mkTy :: Field TAQ -> C C.GType
+mkTy :: Field TAQ -> C C.Type
 mkTy f@(Field _ len _ ty _) = do
-  symbol__ <- require symbol
-  let ret
-        | ty==Numeric    && len==9 = C.SimpleTy uint
-        | ty==Numeric    && len==7 = C.SimpleTy uint
-        | ty==Numeric    && len==3 = C.SimpleTy ushort
-        | ty==Numeric              = error $ "Unknown integer len for " ++ show f
-        | ty==Alphabetic && len==1 = C.SimpleTy char
-        | ty==Alphabetic           = C.SimpleTy symbol__
-        | ty==Boolean              = assert (len==1) $ C.SimpleTy bool
-        | ty==Date                 = C.SimpleTy uint -- assert?
-        | ty==Time                 = C.SimpleTy uint -- assert?
-        | otherwise                = error "Unknown case."
+  ret <- if
+    | ty==Numeric    && len==9 -> pure uint
+    | ty==Numeric    && len==7 -> pure uint
+    | ty==Numeric    && len==3 -> pure ushort
+    | ty==Numeric              -> error $ "Unknown integer len for " ++ show f
+    | ty==Alphabetic && len==1 -> pure char
+    | ty==Alphabetic           -> symbol
+    | ty==Boolean              -> pure $ assert (len==1) $ bool
+    | ty==Date                 -> pure uint -- assert?
+    | ty==Time                 -> pure uint -- assert?
+    | otherwise                -> error "Unknown case."
   return ret
 
 readMember dst src f@(Field _ len nm ty _) = case ty of
@@ -71,7 +71,7 @@ readMember dst src f@(Field _ len nm ty _) = case ty of
   Time       -> runIntegral
   where
     runIntegral = do
-      readInt <- cReadIntegral =<< (C.simplety <$> mkTy f)
+      readInt <- cReadIntegral =<< mkTy f
       return [i|${dst} = ${readInt} (${src}, ${len}); |]
 
 handleMsgGzip :: Message TAQ -> C Code
