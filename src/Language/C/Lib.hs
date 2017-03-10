@@ -36,7 +36,7 @@ cpp_unordered_map k v = do
 rolling_window :: Type -> (Exp -> Exp -> Exp) -> C Type
 rolling_window ty op = do
   include "vector"
-  cty window_class
+  cty window_class -- define the window class
   opName <- genId "op"
   cty (opTy opName)
   return $ Type [i|window<${ty}, struct ${opName}>|]
@@ -52,6 +52,9 @@ rolling_window ty op = do
       template<typename T, typename Op>
       class window
       {
+#if DEBUG_CONTAINER
+        public :
+#endif
         Op op;
         typedef struct
         {
@@ -61,6 +64,7 @@ rolling_window ty op = do
         std::vector<element_t> front;
         std::vector<element_t> back;
 
+        public :
         void push(T const &t) {
 
           if (front.empty()) {
@@ -84,7 +88,7 @@ rolling_window ty op = do
 
         void pop(void) {
 
-          if empty() {
+          if (empty()) {
             return;
           }
 
@@ -109,12 +113,36 @@ rolling_window ty op = do
             front.clear();
 
             // back is now guaranteed to have at least one element
-            back.pop();
+            back.pop_back();
 
           } else {
-            back.pop();
+            back.pop_back();
             return;
           }
+        }
+
+        T const &peek(void) const {
+          // UNDEFINED BEHAVIOR
+          if (empty()) {
+            return front.front().acc;
+          }
+
+          // The oldest element in the FIFO queue
+          // is the BOTTOM of the first LIFO stack
+          // if the second LIFO stack is empty,
+          // otherwise it is the TOP of the second
+          // LIFO stack.
+
+          // The oldest element in the FIFO queue
+          // is the BOTTOM of the first LIFO stack.
+          if (back.empty()) {
+            return front.front().data;
+          }
+
+          // The oldest element in the FIFO queue
+          // is the top of the second LIFO stack
+          return back.back().data;
+
         }
 
         T accumulate(void) const {
@@ -138,9 +166,10 @@ rolling_window ty op = do
           return front.size() + back.size();
         }
 
-        void empty(void) const {
+        bool empty(void) const {
           return front.empty() && back.empty();
           // is `return !size();` faster since it avoids a branch?
         }
       };
       |]
+
