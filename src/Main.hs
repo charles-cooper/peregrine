@@ -250,8 +250,8 @@ mapP f x = signal $ \ctx -> Fix $ MapExp ctx f x
 guardP :: Signal a -> Signal a -> Peregrine a
 guardP pred x = signal $ \ctx -> Fix $ GuardExp ctx (pred) (x)
 
-restrict :: Signal a -> Signal a -> Peregrine a
-restrict x y = signal $ \ctx -> Fix $ RestrictExp ctx x y
+fireWhen :: Signal a -> Signal a -> Peregrine a
+fireWhen x y = signal $ \ctx -> Fix $ RestrictExp ctx x y
 
 lastP :: Signal a -> Peregrine a
 lastP x = signal $ \ctx -> Fix $ LastExp ctx (x)
@@ -1262,7 +1262,7 @@ groupBySymbol signalWithGroup = do
 
 countP :: Signal a -> Peregrine a
 countP sig = (@! "count") $ do
-  sumP =<< 1 `restrict` sig
+  sumP =<< 1 `fireWhen` sig
 
 sqrtP :: Signal a -> Peregrine a
 sqrtP = mapP (Math "sqrt")
@@ -1346,3 +1346,4 @@ main = do
   timer "total" $ forConcurrently_ files $ \file -> withPool pool $ \() -> do
     path <- pure $ "data/TAQ/" ++ file
     timer file $ callCommand [i|bin/peregrine < ${path} | sort | tee foo|]
+
