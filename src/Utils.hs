@@ -3,6 +3,7 @@ import Data.List
 import Data.Maybe
 import Data.Char
 import System.IO
+import System.IO.Unsafe
 import Data.Time.Clock
 
 foreach :: [a] -> (a -> b) -> [b]
@@ -42,4 +43,13 @@ timer msg action = do
   t1 <- getCurrentTime
   hPutStrLn stderr $ msg ++ " took " ++ show (t1 `diffUTCTime` t0)
   return ret
+
+todo :: String -> a
+todo = error . ("TODO: " ++)
+           
+traceWith :: (a -> String) -> a -> a
+traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
+           
+trace :: Show a => String -> a -> a
+trace s = traceWith $ ((s++": ")++) . show
 

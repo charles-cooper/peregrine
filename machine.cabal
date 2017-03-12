@@ -23,16 +23,25 @@ executable machine
     -threaded
     --with-rtsopts="-N"
   default-language:    Haskell2010
-  other-modules:       Language.C.Utils
+  other-modules:       Utils
+
+                     , Language.Utils
+
+                     , Language.C.Utils
                      , Language.C.Lib
+
                      , Protocol
                      , Protocol.Backend.C.Base
                      , Protocol.Tmx.TAQ
                      , Protocol.Tmx.TAQ.C
                      , Protocol.Nasdaq.ITCH.Proto
                      , Protocol.Nasdaq.ITCH.Proto.C
-                     , Language.Utils
-                     , Utils
+
+                     , Language.Peregrine
+                     , Language.Peregrine.AST
+                     , Language.Peregrine.DSL
+                     , Language.Peregrine.Run
+                     , Language.Peregrine.Compiler
 
   build-depends:       base >= 4.7 && < 5
                      , containers
