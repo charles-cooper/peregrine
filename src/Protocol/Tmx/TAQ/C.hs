@@ -1,7 +1,11 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE MultiWayIf #-}
-module Protocol.Tmx.TAQ.C where
+module Protocol.Tmx.TAQ.C (
+  cspec,
+  ctaq,
+  symbol,
+) where
 import Protocol
 import Protocol.Tmx.TAQ
 import Protocol.Backend.C.Base as C
@@ -13,13 +17,15 @@ import Utils
 import Data.List (intercalate)
 
 -- specification for c implementation
-
-taqCSpec :: C.Specification TAQ
-taqCSpec = C.Specification
+cspec :: C.Specification TAQ
+cspec = C.Specification
   { _proto      = taq
   , _mkTy       = mkTy
   , _readMember = readMember
   }
+
+ctaq :: Proto CField
+ctaq = cproto cspec
  
 symbol :: C C.Type
 symbol = do
@@ -80,8 +86,8 @@ readTime = do
     |]
   return fname
 
-readMember :: Exp -> Exp -> Field TAQ -> C Code
-readMember dst src f@(Field _ len nm ty _) = case ty of
+readMember :: Field TAQ -> Exp -> Exp -> C Code
+readMember f@(Field _ len nm ty _) dst src = case ty of
   Numeric    -> runIntegral
   Alphabetic -> return $ if len == 1
                   then [i|${dst} = *${src};|]
@@ -98,9 +104,9 @@ readMember dst src f@(Field _ len nm ty _) = case ty of
       readInt <- cReadIntegral uint
       return [i|${dst} = ${readTime}(${readInt}(${src}, ${len})); |]
 
-handleMsgGzip :: Message TAQ -> C Code
+handleMsgGzip :: Message CField -> C Code
 handleMsgGzip msg = do
-  struct <- require $ genStruct taqCSpec msg
+  struct <- genStruct msg
   return [i|write(${fdName msg}.writefd,
           &msg.${_msgName msg},
           sizeof(struct ${_msgName msg}));|]

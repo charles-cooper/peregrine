@@ -1,4 +1,7 @@
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveFoldable #-}
+{-# LANGUAGE DeriveTraversable #-}
 module Protocol where
 
 import Control.Exception.Base as GHC (assert)
@@ -38,24 +41,21 @@ data Field a = Field
   , _name    :: String  -- field name
   , _atype   :: a       -- abstract 'type' to be mapped to target arch
   , _notes   :: String  -- any notes. suggest you use [note||] quasiquote
-  } deriving (Eq, Show, Ord)
+  } deriving (Eq, Show, Ord, Functor, Foldable, Traversable)
+
 data Message a = Message
   { _msgName :: String
   , _tag     :: Char -- todo make this a type variable
   , _fields  :: [Field a]
-  } deriving (Eq, Show, Ord)
+  } deriving (Eq, Show, Ord, Functor, Foldable, Traversable)
 
--- data Proxy a = Proxy deriving Show
 data Proto a = Proto
   { _namespace        :: String
   , _lineSeparated    :: Bool
   , _pktHdrLen        :: Int
   , _incomingMessages :: [Message a]
   , _outgoingMessages :: [Message a]
-  } deriving (Eq, Ord)
-
-instance Show (Proto a) where
-  show = _namespace
+  } deriving (Eq, Ord, Show, Functor, Foldable, Traversable)
 
 makeLenses ''Proto
 makeLenses ''Field

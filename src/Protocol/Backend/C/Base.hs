@@ -2,6 +2,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE StandaloneDeriving #-}
 module Protocol.Backend.C.Base where
 
 import           Language.C.Utils as C
@@ -21,6 +22,8 @@ import           Utils
 import           Data.Monoid
 
 import           Control.Monad
+import           Control.Arrow
+import           Control.Lens
 
 import           System.IO.Unsafe (unsafePerformIO)
 import           System.IO
@@ -29,13 +32,45 @@ import           System.Process
 data Specification a = Specification
   { _proto      :: Proto a
   , _mkTy       :: Field a -> C Type
-  , _readMember :: C.Exp -> C.Exp -> Field a -> C Code
+  , _readMember :: Field a -> C.Exp -> C.Exp -> C Code
   }
 
-data MsgHandler a = MsgHandler
-  { _handleMsg  :: Message a -> C Code
-  , _initMsg    :: Message a -> C Code
-  , _cleanupMsg :: Message a -> C Code
+data CField = CField { _cty :: C Type, _readField :: Exp -> Exp -> C Code }
+
+cproto :: Specification a -> Proto CField
+cproto spec@(Specification proto _ _) = proto
+  { _outgoingMessages = cmessage spec <$> _outgoingMessages proto
+  , _incomingMessages = cmessage spec <$> _incomingMessages proto
+  }
+
+cmessage :: Specification a -> Message a -> Message CField
+cmessage spec msg = msg & fields %~ fmap (cfield spec)
+
+cfield :: Specification a -> Field a -> Field CField
+cfield spec f = f & atype .~ (CField (mkTy f) (readMember f))
+  where
+    mkTy       = _mkTy spec
+    readMember = _readMember spec
+
+-- Overlapping since CField has no Eq instance
+instance {-# OVERLAPPING #-} Eq (Field CField) where
+  -- == ignoring the CField parameter
+  a == b = (() <$ a) == (() <$ b)
+ 
+-- Overlapping since CField has no Ord instance
+instance {-# OVERLAPPING #-} Ord (Field CField) where
+  -- compare ignoring the CField parameter
+  a `compare` b = (() <$ a) `compare` (() <$ b)
+ 
+deriving instance {-# OVERLAPPING #-} Eq (Message CField)
+deriving instance {-# OVERLAPPING #-} Ord (Message CField)
+deriving instance {-# OVERLAPPING #-} Eq (Proto CField)
+deriving instance {-# OVERLAPPING #-} Ord (Proto CField)
+ 
+data MsgHandler = MsgHandler
+  { _handleMsg  :: Message CField -> C Code
+  , _initMsg    :: Message CField -> C Code
+  , _cleanupMsg :: Message CField -> C Code
   }
 
 -- non-overlapping monoid instance for (a -> m b)
@@ -44,7 +79,7 @@ mempty_ _ = pure mempty
 mappend_ :: (Applicative t, Monoid m) => (a -> t m) -> (a -> t m) -> (a -> t m)
 mappend_ f g = \a -> (<>) <$> f a <*> g a
 
-instance Monoid (MsgHandler a) where
+instance Monoid MsgHandler where
   mempty = MsgHandler empty empty empty
     where empty = const (return mempty)
   mappend (MsgHandler h1 i1 c1) (MsgHandler h2 i2 c2) = MsgHandler h3 i3 c3
@@ -65,23 +100,19 @@ cstruct name members = do
 cnm :: String -> Identifier
 cnm = Identifier . rawIden . cname
 
-genStruct :: Specification a -> Message a -> C C.Type
-genStruct spec msg = do
+genStruct :: Message CField -> C C.Type
+genStruct msg = do
   decls <- runDecls
   cstruct (cnm $ _msgName msg) decls
   where
-    runDecls = mapM declare (_fields msg)
-    declare f@(Field _ len nm ty _) = mkCsdecl (rawIden $ cname nm) <$> mkTy f
-    mkTy = _mkTy spec
+    runDecls = forM (_fields msg) $ \f -> do
+      ty <- _cty (_atype f)
+      return (ty, cnm (_name f))
 
-mkCsdecl :: String -> C.Type -> (C.Type, C.Identifier)
-mkCsdecl nm ty = (ty, Identifier nm)
--- mkCsdecl nm (C.ArrayTy ty sz) = (ty, Identifier [i|${nm}[${sz}]|])
- 
-readStruct :: Specification a -> Message a -> C Identifier
-readStruct spec@(Specification {..}) msg = do
+readStruct :: Message CField -> C Identifier
+readStruct msg = do
   include "cstring"
-  require (genStruct spec msg)
+  genStruct msg
   require impl
   return funName
   where
@@ -95,29 +126,29 @@ readStruct spec@(Specification {..}) msg = do
     funName :: Identifier = [qc|read_{structName}|]
     structName        = cnm $ _msgName msg
     ofsts             = scanl (+) 0 (_len <$> _fields msg)
-    read ofst field   = _readMember
+    read ofst field   = (_readField (_atype field))
       [i|dst->${cnm (_name field)}|]
       [i|buf + ${ofst}|]
-      field
     mkStms            = zipWithM read ofsts (_fields msg)
  
-mainLoop :: Specification a -> MsgHandler a -> C Identifier
-mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
+mainLoop :: Specification a -> MsgHandler -> C Identifier
+mainLoop spec handler@(MsgHandler {..}) = do
+  let proto = cproto spec
   include "stdio.h"
 
-  structs :: [Code] <- forM (_outgoingMessages _proto) $ \msg -> do
-    struct <- require $ genStruct spec msg
+  structs :: [Code] <- forM (_outgoingMessages proto) $ \msg -> do
+    struct <- genStruct msg
     return [i|struct ${cnm $ _msgName msg} ${cnm $ _msgName msg}|]
 
-  cases :: [Code] <- forM (_outgoingMessages _proto) $ \msg -> do
-    readMsg   <- readStruct spec msg
-    struct    <- require $ genStruct spec msg
+  cases :: [Code] <- forM (_outgoingMessages proto) $ \msg -> do
+    readMsg   <- readStruct msg
+    struct    <- genStruct msg
     handleMsg <- _handleMsg msg
     let prefix = Exp [i|msg.${cnm $ _msgName msg}|]
  
     return [i|case ${_tag msg} : {
  
-      if (fread(buf, 1, ${bodyLen _proto msg}, stdin) == 0) {
+      if (fread(buf, 1, ${bodyLen proto msg}, stdin) == 0) {
         return -1;
       }
       /* parse struct */
@@ -131,9 +162,9 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
 
   include "cassert"
   let
-    readHeader = if _pktHdrLen _proto > 0
+    readHeader = if _pktHdrLen proto > 0
       then [i|
-        if (fread(buf, 1, ${_pktHdrLen _proto}, stdin) == 0) {
+        if (fread(buf, 1, ${_pktHdrLen proto}, stdin) == 0) {
           return -1;
         }|]
       else []
@@ -162,12 +193,12 @@ mainLoop spec@(Specification {..}) handler@(MsgHandler {..}) = do
   |]
   return (Identifier funName)
  
-cmain :: Specification a -> MsgHandler a -> C C.Func
-cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
+cmain :: Specification a -> MsgHandler -> C C.Func
+cmain spec handler@(MsgHandler {..}) = do
   include "cstdio"
   loopStep     <- mainLoop spec handler
-  initMsgs     <- _initMsg `mapM` _outgoingMessages _proto
-  cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages _proto
+  initMsgs     <- _initMsg `mapM` _outgoingMessages proto
+  cleanupMsgs  <- _cleanupMsg `mapM` _outgoingMessages proto
  
   cfun [i|int main(int argc, char **argv) {
     ${concat initMsgs}
@@ -186,8 +217,9 @@ cmain spec@(Specification {..}) handler@(MsgHandler {..}) = do
  
   }|]
   where
-    bufLen     = maximum $ foreach (_outgoingMessages _proto) $
-      rotateL (1::Int) . (+1) . logBase2 . bodyLen _proto
+    proto      = cproto spec
+    bufLen     = maximum $ foreach (_outgoingMessages proto) $
+      rotateL (1::Int) . (+1) . logBase2 . bodyLen proto
  
     logBase2 x = finiteBitSize x - 1 - countLeadingZeros x
 

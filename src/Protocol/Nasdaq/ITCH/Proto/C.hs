@@ -32,8 +32,8 @@ mkTy f@(Field _ len _ ty _) = do
     | ty==Price8  && len==8 -> return ulong
     | otherwise             -> error $ "No rule to make type for "++(show f)
 
-readMember :: C.Exp -> C.Exp -> Field ITCH -> C Code
-readMember dst src f@(Field _ len _ ty _) = case ty of
+readMember :: Field ITCH -> C.Exp -> C.Exp -> C Code
+readMember f@(Field _ len _ ty _) dst src = case ty of
   Alpha   -> if len == 1
    then pure [i|${dst} = *${src};|]
    else do
