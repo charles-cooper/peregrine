@@ -41,8 +41,9 @@ runDirectory :: FilePath -> CP.Specification a -> Peregrine -> IO ()
 runDirectory dir spec program = do
   CP.compile opts "bin" $ Peregrine.codegen spec program
   pool <- mkPool (take 8{-num core-} (repeat ()))
-  files <- listDirectory dir
-  timer "total" $ forConcurrently_ files $ \file -> withPool pool $ \() -> do
-    path <- pure $ dir </> file
-    timer file $ callCommand [i|bin/peregrine < ${path} | sort | tee foo|]
+  files <- filter ((".lz4"==) . takeExtension) <$> listDirectory dir
+  timer "total" $ forConcurrently_ files $ \file -> do
+    withPool pool $ \() -> do
+      path <- pure $ dir </> file
+      timer file $ callCommand [i|lz4 -d < ${path} | bin/peregrine | sort | tee foo > /dev/null|]
 
