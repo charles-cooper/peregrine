@@ -1,4 +1,5 @@
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -27,7 +28,9 @@ import           Control.Lens
 
 import           System.IO.Unsafe (unsafePerformIO)
 import           System.IO
-import           System.Process
+import           System.Process.Typed
+import           System.Exit (ExitCode(..))
+import           Control.Exception
 
 data Specification a = Specification
   { _proto      :: Proto a
@@ -231,10 +234,21 @@ codeGen dbg code = clang_format . s 80 . ppr $ mkCompUnit code
       else pretty
 
 clang_format :: String -> String
-clang_format = unsafePerformIO . readProcess "clang-format"
-  [ "-assume-filename=cpp"
-  , "-style={BasedOnStyle: Google, BreakBeforeBraces: Linux, NamespaceIndentation: All}"
-  ]
+clang_format cpp = unsafePerformIO $ do
+  out <- readProcessStdout_ extern_clang_format
+  return $ decodeUtf8String out
+  where
+    extern_clang_format = proc "clang-format"
+      [ [i|-assume-filename=cpp|]
+      , filter (/='\n') $ trim $ dedent [i|
+            -style=
+            { BasedOnStyle: Google
+            , BreakBeforeBraces: Linux
+            , NamespaceIndentation: All
+            }
+          |]
+      ]
+      & setStdin (byteStringInput (encodeUtf8String cpp))
 
 type Debug = Bool
 
@@ -244,7 +258,7 @@ compile :: CompileOptions -> FilePath -> C a -> IO ()
 compile (CompileOptions dbg optLevel compiler oname) buildDir code = do
   timer "codegen" $ writeFile src (codeGen False code)
   hPutStrLn stderr $ "## " ++ cmd
-  timer "compile" $ callCommand cmd
+  timer "compile" $ runProcess_ (shell cmd)
   where
     cmd = [qc|{cc} -std=c++11 -march=native -O{optLevel} {dbgFlag} -o {out} {src}|]
     cc  = compilerCmd compiler

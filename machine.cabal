@@ -21,7 +21,7 @@ executable machine
     -fwarn-missing-fields
     -freverse-errors
     -threaded
-    --with-rtsopts="-N"
+    "-with-rtsopts=-N4"
   default-language:    Haskell2010
   other-modules:       Utils
 
@@ -45,6 +45,7 @@ executable machine
 
   build-depends:       base >= 4.7 && < 5
                      , containers
+                     , map-exts
 
                      , mtl
                      , data-fix
@@ -55,11 +56,14 @@ executable machine
                      , interpolate
                      , string-conversions
                      , text
+                     , bytestring
                      , srcloc
 
                      , lens
 
-                     , process
+                     , typed-process
+                     , stm
+                     , conduit
                      , time
                      , directory
                      , shake

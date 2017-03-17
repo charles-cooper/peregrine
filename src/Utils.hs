@@ -1,10 +1,20 @@
 module Utils where
 import Data.List
 import Data.Maybe
+import Data.Function
 import Data.Char
 import System.IO
 import System.IO.Unsafe
 import Data.Time.Clock
+import System.Process.Typed
+import System.Exit (ExitCode(..))
+import Control.Monad.IO.Class
+import Control.Concurrent.STM (atomically)
+import Control.Exception
+import Data.ByteString.Lazy.Char8 as B8 (ByteString)
+import qualified Data.ByteString.Lazy.Char8 as B8
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 
 foreach :: [a] -> (a -> b) -> [b]
 foreach = flip map
@@ -53,3 +63,26 @@ traceWith f a = unsafePerformIO $ putStrLn (f a) >> return a
 trace :: Show a => String -> a -> a
 trace s = traceWith $ ((s++": ")++) . show
 
+-- Basically readProcess_ except it prints child stderr to stderr
+readProcessStdout_ :: MonadIO m
+  => ProcessConfig stdin stdoutIgnored stderrIgnored
+  -> m ByteString
+readProcessStdout_ pc = liftIO $ do
+  -- withProcess_ (setStdout byteStringOutput pc) $ atomically . getStdout
+  (ecode, out, err) <- readProcess pc
+  B8.hPutStrLn stderr err
+  case ecode of
+    ExitSuccess -> return ()
+    _ -> throwIO $ ExitCodeException ecode (clearStreams pc) mempty mempty
+  return out
+  where
+    clearStreams pc = pc
+      & setStdin inherit
+      & setStdout inherit
+      & setStderr inherit
+
+decodeUtf8String :: ByteString -> String
+decodeUtf8String = T.unpack . T.decodeUtf8 . B8.toStrict
+
+encodeUtf8String :: String -> ByteString
+encodeUtf8String = B8.fromStrict . T.encodeUtf8 . T.pack

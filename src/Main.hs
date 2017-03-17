@@ -5,6 +5,15 @@ import           Protocol.Tmx.TAQ.C as TAQ
 
 import           Control.Monad
 
+import qualified Data.Map.Extensions as Map
+import           Data.Map (Map)
+import           Control.Arrow
+import           Control.Monad.Identity
+import           Data.Time.Calendar
+
+import Utils
+import qualified Numeric as Num
+
 symbolP :: Peregrine
 symbolP = do
   tsymbol <- project ctaq "trade" "Symbol" @! "tsymbol"
@@ -121,7 +130,7 @@ groupBySymbol signalWithGroup = do
 
 main :: IO ()
 main = do
-  runDirectory "data/TAQ/" TAQ.cspec $ do
+  ret <- runDirectory "data/TAQ/" TAQ.cspec $ do
     s <- symbolP
     mps <- midpointSkew s
     mp  <- midpointP s
@@ -138,6 +147,27 @@ main = do
       minWin <- window Min 1000 t px           @! "min window"
       let accum = mapP (Window "accumulate")
       spike  <- accum maxWin - accum minWin    @! "spike"
-      ret <- foldP Max spike                   @! "max spike over day"
-      summary ret
+      maxSpike <- foldP Max spike              @! "max spike over day"
+
+      dayMax <- foldP Max px
+      dayMin <- foldP Min px
+      hilo <- dayMax -. dayMin
+      pred <- hilo >. 0
+      hilo <- guardP pred hilo
+      summary =<< maxSpike /. hilo
+
+  let
+    -- 20150818
+    parseDay s = runIdentity {-no parsec needed!-} $ do
+      (yy, s) <- pure $ first read $ splitAt 4 s
+      (mm, s) <- pure $ first read $ splitAt 2 s
+      (dd, s) <- pure $ first read $ splitAt 2 s
+      return $ fromGregorian yy mm dd
+    foo = Map.fromList $ map (parseDay *** (getGroups . decodeUtf8String)) ret
+    pad = take 8 . (++ repeat ' ')
+
+  forM_ (Map.toList (Map.transpose foo)) $ \(s, m) -> do
+    putStrLn s
+    forM_ (Map.toList m) $ \(d, v) -> do
+      putStrLn $ show d ++ " -> " ++ (Num.showFFloatAlt Nothing v "")
 
