@@ -63,7 +63,9 @@ getGroups = Map.fromList . map go . lines
 runDirectory :: FilePath -> CP.Specification a -> Peregrine -> IO [(String, ByteString)]
 runDirectory dir spec program = do
   CP.compile opts "bin" $ Peregrine.codegen spec program
-  pool <- mkPool (take 8{-num core-} (repeat ()))
+  numCores <- getNumCapabilities
+  let numThreads = numCores * 2 -- standard HT architecture
+  pool <- mkPool (take numThreads (repeat ()))
   files <- filter ((".lz4"==) . takeExtension) <$> listDirectory dir
   timer "total" $ forConcurrently files $ \file -> do
     withPool pool $ \() -> do
