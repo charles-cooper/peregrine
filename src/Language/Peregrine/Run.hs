@@ -7,6 +7,7 @@ import           Data.String.Interpolate
 
 import           Control.Concurrent
 import           Control.Concurrent.Async
+import qualified GHC.Conc as Conc
 
 import           Control.Exception
 import           System.Process.Typed
@@ -63,9 +64,8 @@ getGroups = Map.fromList . map go . lines
 runDirectory :: FilePath -> CP.Specification a -> Peregrine -> IO [(String, ByteString)]
 runDirectory dir spec program = do
   CP.compile opts "bin" $ Peregrine.codegen spec program
-  numCores <- getNumCapabilities
-  let numThreads = numCores * 2 -- standard HT architecture
-  pool <- mkPool (take numThreads (repeat ()))
+  numCores <- Conc.getNumProcessors -- getNumCapabilities is so wrong
+  pool <- mkPool (replicate numCores ())
   files <- filter ((".lz4"==) . takeExtension) <$> listDirectory dir
   timer "total" $ forConcurrently files $ \file -> do
     withPool pool $ \() -> do

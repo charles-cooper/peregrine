@@ -21,7 +21,7 @@ executable machine
     -fwarn-missing-fields
     -freverse-errors
     -threaded
-    "-with-rtsopts=-N4"
+    -- with-rtsopts +N sets numCapabilities to 1. so wrong.
   default-language:    Haskell2010
   other-modules:       Utils
 
