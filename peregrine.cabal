@@ -1,21 +1,19 @@
-name:                machine
-version:             0.1.0.0
-synopsis:            Simple project template from stack
-description:         Please see README.md
-homepage:            http://github.com/githubuser/machine#readme
-license:             BSD3
-license-file:        LICENSE
-author:              Author name here
-maintainer:          example@example.com
-copyright:           2016 Author Here
+name:                peregrine
+version:             0.2.0
+synopsis:            Peregrine compiler
+homepage:            https://coopertech.co
+author:              Charles Cooper
+maintainer:          charles@coopertech.co
+copyright:           2017 Charles Cooper
 category:            Web
 build-type:          Simple
 cabal-version:       >=1.10
 
-executable machine
+executable peregrine
   hs-source-dirs:      src
   main-is:             Main.hs
   ghc-options:
+    -- TODO make these into errors
     -fwarn-incomplete-patterns
     -fwarn-incomplete-uni-patterns
     -fwarn-missing-fields
