@@ -1,2 +1,2 @@
 #!/bin/sh
-stack build --install-ghc --trace --fast --file-watch machine --exec machine
+stack build --install-ghc --haddock --trace --fast --file-watch machine --exec machine
