@@ -1,5 +1,6 @@
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Language.Peregrine.DSL where
 
 import           Language.Peregrine.AST
@@ -12,18 +13,21 @@ import           Protocol.Backend.C.Base
 
 import           Data.Ratio
 
-type Signal = Fix (ASTF (Context Group))
+newtype Signal = Signal (Fix (ASTF (Context Group)))
+  deriving (Eq, Ord)
    
 newtype Group = Group { getGroup :: [Signal] }
   deriving (Eq, Ord)
 
 -- Monad for Peregrine language. It keeps knowledge of groupBy fences
-type Peregrine = Reader Group Signal
+newtype PeregrineM a = PeregrineM (Reader Group a)
+  deriving (Functor, Applicative, Monad, MonadReader Group)
+type Peregrine = PeregrineM Signal
 
 incomplete :: a
 incomplete = error "Incomplete instance"
 instance Num Signal where
-  fromInteger = Fix . ConstExp . ConstInt . fromInteger
+  fromInteger = Signal . Fix . ConstExp . ConstInt . fromInteger
   (+)    = incomplete
   (*)    = incomplete
   (-)    = incomplete
@@ -51,52 +55,63 @@ addAnnotation s = mapCtx setAnn
 infixr 1 @!
 (@!) :: Peregrine -> String -> Peregrine
 p @! ann = do
-  sig <- p
-  return $ Fix (addAnnotation ann (unFix sig))
+  (Signal sig) <- p
+  return $ Signal (Fix (addAnnotation ann (unFix sig)))
 
 groupBy :: Signal -> Peregrine -> Peregrine
 groupBy group next = do
   local (Group . (group:) . getGroup) next
-      
-signal :: (Context Group -> Signal) -> Peregrine
+
+signal :: (Context Group -> Fix (ASTF (Context Group))) -> Peregrine
 signal ast = do
   gs <- ask
   ctx <- pure $ Context gs Nothing
-  return (ast ctx)
-      
+  return (Signal (ast ctx))
+
 merge :: Signal -> Signal -> Peregrine
-merge x y = signal $ \ctx -> Fix $ MergeExp ctx (x) (y)
-      
+merge (Signal x) (Signal y) = signal $ \ctx -> Fix $
+  MergeExp ctx x y
+
 project :: Proto CField -> String -> String -> Peregrine
-project p x y = signal $ \ctx -> Fix $ ProjectExp ctx (Projection p x y)
-      
+project proto msg field = signal $ \ctx -> Fix $
+  ProjectExp ctx (Projection proto msg field)
+
 zipWithP :: BinOp -> Signal -> Signal -> Peregrine
-zipWithP op x y = signal $ \ctx -> Fix $ ZipWith ctx op (x) (y)
-      
+zipWithP op (Signal x) (Signal y) = signal $ \ctx -> Fix $
+  ZipWith ctx op (x) (y)
+
 foldP :: BinOp -> Signal -> Peregrine
-foldP op x = signal $ \ctx -> Fix $ FoldExp ctx op (x)
-      
+foldP op (Signal x) = signal $ \ctx -> Fix $
+  FoldExp ctx op x
+
 mapP :: UnaryOp -> Signal -> Peregrine
-mapP f x = signal $ \ctx -> Fix $ MapExp ctx f x
-      
+mapP f (Signal x) = signal $ \ctx -> Fix $
+  MapExp ctx f x
+
 guardP :: Signal -> Signal -> Peregrine
-guardP pred x = signal $ \ctx -> Fix $ GuardExp ctx (pred) (x)
-      
+guardP (Signal pred) (Signal x) = signal $ \ctx -> Fix $
+  GuardExp ctx pred x
+
 fireWhen :: Signal -> Signal -> Peregrine
-fireWhen x y = signal $ \ctx -> Fix $ RestrictExp ctx x y
-      
+fireWhen (Signal x) (Signal y) = signal $ \ctx -> Fix $
+  RestrictExp ctx x y
+
 window :: BinOp -> Int -> Signal -> Signal -> Peregrine
-window op span t x = signal $ \ctx -> Fix $ WindowExp ctx op span t x
-      
+window op span (Signal t) (Signal x) = signal $ \ctx -> Fix $
+  WindowExp ctx op span t x
+
 lastP :: Signal -> Peregrine
-lastP x = signal $ \ctx -> Fix $ LastExp ctx (x)
-      
+lastP (Signal x) = signal $ \ctx -> Fix $
+  LastExp ctx x
+
 -- TODO change the group, `observe x` should have same group as `x`
 observe :: Signal -> Peregrine
-observe x = signal $ \ctx -> Fix $ ObserveExp ctx Every x
-      
+observe (Signal x) = signal $ \ctx -> Fix $
+  ObserveExp ctx Every x
+
 summary :: Signal -> Peregrine
-summary x = signal $ \ctx -> Fix $ ObserveExp ctx Summary x
+summary (Signal x) = signal $ \ctx -> Fix $
+  ObserveExp ctx Summary x
 
 infixl 8 ==.
 infixl 7 <.

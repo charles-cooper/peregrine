@@ -4,7 +4,6 @@
 
 module Language.Peregrine.AST where
 
-import           Data.Fix
 import           Protocol.Backend.C.Base as CP
 import           Protocol
 import qualified Language.C.Utils as C

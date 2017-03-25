@@ -620,16 +620,17 @@ compileObserve (deps, ctx) observeType x = do
            
   return $ CompInfo (src x) (ref x) (ctype x) deps tmp cleanup handler
            
-assignNodeIds ::Signal -> (NodeID, Nodes (Context IGroup))
-assignNodeIds ast = (,) root (IMap.fromList . map swap . Map.toList $ st)
-  where    
-    (root, st) = runState (go ast) mempty
+assignNodeIds :: Signal -> (NodeID, Nodes (Context IGroup))
+assignNodeIds (Signal ast) = (,) root (invert st)
+  where
+    invert = IMap.fromList . map swap . Map.toList
+    (root, st) = runState (go (Signal ast)) mempty
     runGroup (Context (Group g) a) = do
       g <- mapM go g
       return (Context g a)
-    go (Fix ast) = do
+    go (Signal (Fix ast)) = do
       -- assign node ids for all the group signals
-      ast <- mapM go ast
+      ast <- mapM (go . Signal) ast
       ast <- mapCtxM runGroup ast
       st  <- get
       case Map.lookup ast st of
@@ -781,7 +782,7 @@ compileAST root = go root -- could this use hyloM?
           return compInfo
 
 runPeregrine :: Peregrine -> Signal
-runPeregrine peregrine = runReader peregrine (Group [])
+runPeregrine (PeregrineM pg) = runReader pg (Group [])
 
 runIntermediate :: CompEnv -> PeregrineC a -> C (a, CompState)
 runIntermediate env p = runReaderT
