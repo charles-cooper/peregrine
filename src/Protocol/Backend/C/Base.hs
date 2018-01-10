@@ -12,7 +12,8 @@ import           Protocol
 
 import           Development.Shake
 
-import           Text.PrettyPrint.Mainland (putDocLn, ppr, pretty, prettyPragma)
+import           Text.PrettyPrint.Mainland (putDocLn, pretty, prettyPragma)
+import           Text.PrettyPrint.Mainland.Class (Pretty(..))
 import           Text.InterpolatedString.Perl6
 import           Data.String.Interpolate.IsString
 
