@@ -1,5 +1,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE FlexibleContexts #-}
+-- https://api.tmxwebstore.com/commerce/product/docs/view/trades-and-quotes-specifications-2015-11-16-en.pdf
+-- From https://www.tmxwebstore.com/products/trades-and-quotes-daily#view-details, accessed 01/09/2018
 
 module Protocol.Tmx.TAQ (
   tradeFields,

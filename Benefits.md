@@ -1,29 +1,28 @@
-FAQ
-===
+# FAQ
 
-**What is Peregrine?**
+### What is Peregrine?
 
 Peregrine is an embedded domain specific language (EDSL) for implementing automated trading strategies. At its core, it abstracts the usual callback-based architecture of an automated trading system by using signals. By leveraging the composability of signals, a trading system can decouple its alpha generation, risk management and order management constituents.
 
 Peregrine is the core of the Peregrine Framework, which is a framework using the Peregrine language which includes feed and order handlers, research and optimization, and a runtime system for running strategies.
 
-**What is a callback and why do people use them?**
+### What is a callback and why do people use them?
 
 Traditionally, people use callbacks because they map directly onto how trading systems communicate with each other - with messages. Every time the system receives a message, it initiates a callback to notify any subsystems that the message has been received (which in turn may initiate callbacks to *their* subsystems).
 
-**What is a signal and what are its benefits over callbacks?**
+## What is a signal and what are its benefits over callbacks?
 
 A signal is either a raw message or a combination of signals. A limiting factor of callback-based systems is their *composability*. Given a callback-based system that calculates total-dollar-value-traded and one that calculates total-shares-traded it is not easy to combine them into a system that calculates vwap, even though vwap is just the former divided by the latter. Signals bring us back to this intuition by representing vwap simply as total-dollar-value-traded / total-shares-traded.
 
-**I'm concerned about performance. All these abstractions sound nice in theory but in practice abstraction often results in bloated data structures and code.**
+## I'm concerned about performance. All these abstractions sound nice in theory but in practice abstraction often results in bloated data structures and code.
 
-Peregrine was designed from the ground up not only to make writing performant programs easy, but even writing non-performant programs difficult. Peregrine is compiled into C++, and it is easy to predict the type of code it will generate. In terms of data structures, it makes use of `stl`'s `unordered_map`, `vector` and that's it. It does not use allocation besides the bulk allocations `stl` does internally. All the core operations are O(1), and care was taken to make data structures and execution paths local. As a demonstration please see (github.com:charles-cooper/itch-order-book) which is written using some of the above techniques to build an order book which achieves 62ns / tick throughput including message parsing and syscalls.
+Peregrine was designed from the ground up not only to make writing performant programs easy, but even writing non-performant programs difficult. Peregrine is compiled into C++, and it is easy to predict the type of code it will generate. In terms of data structures, it makes use of `stl`'s `unordered_map`, `vector` and that's it. It does not use allocation besides the bulk allocations `stl` does internally. All the core operations are O(1), and care was taken to make data structures and execution paths local. As a demonstration please see (github.com/charles-cooper/itch-order-book) which is written using some of the above techniques to build an order book which achieves 62ns / tick throughput including message parsing and syscalls.
 
-**What about extensibility?**
+## What about extensibility?
 
 Peregrine can produce libraries which are called by or call into C code.
 
-**So .. what is composability?**
+## So .. what is composability?
 
 Composability is the ability to easily piece together systems out of smaller pieces, and then piece together larger systems out of those pieces without knowing how big or complex the internal structure of those subsystems are. That means that the following are all signals:
 
@@ -67,7 +66,7 @@ Even in this small example several weaknesses of the callback implementation are
 
 Peregrine solves these problems by automatically calculating the dependencies of any signal and making sure they are calculated at the correct time in the stack of callbacks.
 
-**How can this help me "decouple" alpha generation, risk management and order management?**
+## How can this help me "decouple" alpha generation, risk management and order management?
 
 In a callback-based system, the programmer has to carefully intertwine all calculations that depend on each other (see above examples). In Peregrine you no longer need to be so careful since the system automates dependency tracking for you. That means that each component can just depend on the *final* values calculated by the other two components. Consider the following toy strategy (for the sake of keeping the size of the example down, exit logic is omitted):
 
@@ -96,7 +95,7 @@ Despite the decidedly simple nature of the strategy, it already has several prop
 1. Everything was defined once. We didn't need to define classes with the values we wanted to keep track of, and then make sure we threaded the values appropriately. We just defined what the signals were in terms of each other and that was it.
 2. Separation of concerns. The alpha signal doesn't need to know about the order manager, *even its existence*, in order for the latter to define a valid strategy. Nor does it need to know about the global risk manager. This makes it easy to mix and match signals with different risk management or order management styles. For instance, if it is later discovered that our alpha is more potent in mid-cap stocks and less potent in small- and large-caps, we can easily add on an adjustment to the risk management part which increases relative size deployed in mid-caps, which can be applied to one, some, or across the board to all strategies. Or, we can add an additional sharpe-based risk management in addition to the total-quantity-based risk management.
 
-**Why is Peregrine an embedded domain-specific language (EDSL) instead of a standalone language?**
+## Why is Peregrine an embedded domain-specific language (EDSL) instead of a standalone language?
 
 We made the decision to embed Peregrine in Haskell, a modern functional language known for its productivity and correctness guarantees. The benefits of embedding in Haskell, which is a pure functional language with a mature ecosystem include:
 1. Peregrine programs can be written as functions of each other. This makes it even easier to generate Peregrine programs and compose them together.

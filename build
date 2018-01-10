@@ -1,2 +1,2 @@
 #!/bin/sh
-stack build --install-ghc --haddock --fast --file-watch peregrine --exec peregrine
+stack build --haddock --fast --file-watch peregrine

@@ -65,6 +65,7 @@ rolling_window dataTy accTy unOp binOp = do
       };
       |]
     window_class = [i|
+      // Generalization of https://stackoverflow.com/a/4802260/2152666 to any associative, commutative operator
       template<typename T, typename Acc, typename Op>
       class window
       {
