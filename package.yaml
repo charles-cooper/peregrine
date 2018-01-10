@@ -1,0 +1,66 @@
+name: peregrine
+version: '0.2.0'
+synopsis: Peregrine framework
+category: Web
+author: Charles Cooper
+maintainer: charles@coopertech.co
+copyright: 2017 Charles Cooper
+license: BSD3
+homepage: https://coopertech.co
+ghc-options:
+- -fwarn-incomplete-patterns
+- -fwarn-incomplete-uni-patterns
+- -fwarn-missing-fields
+- -freverse-errors
+- -threaded
+# skip -with-rtsopts +N because it sets numCapabilities to 1
+dependencies:
+- base >=4.7 && <5
+- containers
+- map-exts
+- mtl
+- data-fix
+- mainland-pretty
+- interpolatedstring-perl6
+- neat-interpolation
+- interpolate
+- string-conversions
+- text
+- bytestring
+- srcloc
+- lens
+- typed-process
+- stm
+- conduit
+- time
+- directory
+- shake
+- async
+library:
+  source-dirs: src
+  exposed-modules:
+  - Utils
+
+  - Language.Utils
+  - Language.C.Utils
+  - Language.C.Lib
+
+  - Protocol
+  - Protocol.Backend.C.Base
+  - Protocol.Tmx.TAQ
+  - Protocol.Tmx.TAQ.C
+  - Protocol.Nasdaq.ITCH.Proto
+  - Protocol.Nasdaq.ITCH.Proto.C
+
+  - Language.Peregrine
+  - Language.Peregrine.AST
+  - Language.Peregrine.DSL
+  - Language.Peregrine.Run
+  - Language.Peregrine.Compiler
+
+executables:
+  peregrine:
+    main: Main.hs
+    source-dirs: app
+    dependencies:
+    - peregrine

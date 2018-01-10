@@ -5,6 +5,8 @@ bin
 data
 out
 
+peregrine.cabal
+
 default.nix
 result
 core
